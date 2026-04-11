@@ -4,11 +4,15 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use futures::StreamExt as _;
 use jj_lib::config::StackedConfig;
+use jj_lib::gitignore::GitIgnoreFile;
+use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
 use jj_lib::repo::StoreFactories;
 use jj_lib::settings::UserSettings;
+use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
 use jj_lib::workspace::default_working_copy_factories;
 use pollster::FutureExt as _;
@@ -73,8 +77,12 @@ pub struct BookmarkState {
     pub is_behind_remote: bool,
 }
 
-/// Opens a JJ workspace at the given path and reads basic repo state.
+/// Opens a JJ workspace at the given path and reads repo state.
 pub fn inspect(path: &Path) -> Result<RepoState> {
+    // Canonicalize path so all output uses absolute paths
+    let path = path.canonicalize()?;
+    let path = path.as_path();
+
     // Build config and settings
     let config = StackedConfig::with_defaults();
     let settings = UserSettings::from_config(config)?;
@@ -82,7 +90,7 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let working_copy_factories = default_working_copy_factories();
 
     // Open workspace
-    let workspace = Workspace::load(
+    let mut workspace = Workspace::load(
         &settings,
         path,
         &store_factories,
@@ -93,17 +101,18 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let repo = workspace.repo_loader().load_at_head().block_on()?;
 
     // Get workspace name
-    let workspace_name = workspace.workspace_name();
+    let workspace_name = workspace.workspace_name().to_owned();
 
     // Get working copy commit id
     let wc_commit_id = repo
         .view()
-        .get_wc_commit_id(workspace_name)
-        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?;
+        .get_wc_commit_id(&workspace_name)
+        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?
+        .clone();
 
     // Load the commit
     let store = repo.store();
-    let commit = store.get_commit(wc_commit_id)?;
+    let commit = store.get_commit(&wc_commit_id)?;
 
     // Read commit info
     let current_commit_id = commit.id().hex();
@@ -124,21 +133,108 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
         true
     };
 
+    // Get commit tree
+    let commit_tree = commit.tree();
+
+    // Snapshot the working copy
+    let snapshot_options = SnapshotOptions {
+        base_ignores: GitIgnoreFile::empty(),
+        progress: None,
+        start_tracking_matcher: &EverythingMatcher,
+        force_tracking_matcher: &EverythingMatcher,
+        max_new_file_size: u64::MAX,
+    };
+
+    let mut locked_ws = workspace.start_working_copy_mutation()?;
+    let (wc_tree, stats) = locked_ws
+        .locked_wc()
+        .snapshot(&snapshot_options)
+        .block_on()?;
+
+    // Diff commit tree against working copy tree
+    let mut diff_stream = commit_tree.diff_stream(&wc_tree, &EverythingMatcher);
+
+    let mut modified_files: Vec<PathBuf> = Vec::new();
+
+    while let Some(entry) = diff_stream.next().block_on() {
+        let fs_path = path.join(entry.path.as_internal_file_string());
+        modified_files.push(fs_path);
+    }
+
+    // Collect untracked files
+    let untracked_files: Vec<PathBuf> = stats
+        .untracked_paths
+        .keys()
+        .map(|p| path.join(p.as_internal_file_string()))
+        .collect();
+
+    let has_changes = !modified_files.is_empty();
+
+    // Collect bookmarks
+    let bookmarks = collect_bookmarks(repo.as_ref(), &wc_commit_id);
+
+    // Determine if remote exists
+    let has_remote = bookmarks.iter().any(|b| b.is_tracked);
+
+    // Determine if safe to rewrite
+    // Not safe if any bookmark tracking a remote points to current commit
+    let is_safe_to_rewrite = !bookmarks.iter().any(|b| {
+        b.is_tracked && !b.is_ahead_of_remote && !b.is_behind_remote
+    });
+
     let root = workspace.workspace_root().to_path_buf();
 
     Ok(RepoState {
         root,
-        modified_files: Vec::new(),
-        untracked_files: Vec::new(),
+        modified_files,
+        untracked_files,
         conflicted_files: Vec::new(),
-        has_changes: false,
+        has_changes,
         has_conflicts: false,
         current_change_id,
         current_commit_id,
         current_description,
         is_empty_commit,
-        is_safe_to_rewrite: true,
-        bookmarks: Vec::new(),
-        has_remote: false,
+        is_safe_to_rewrite,
+        bookmarks,
+        has_remote,
     })
+}
+
+/// Reads all bookmarks and determines their tracking state.
+fn collect_bookmarks(repo: &dyn Repo, wc_commit_id: &jj_lib::backend::CommitId) -> Vec<BookmarkState> {
+    let view = repo.view();
+    let mut result = Vec::new();
+
+    for (name, target) in view.bookmarks() {
+        let local_target = target.local_target;
+        let remote_refs = target.remote_refs;
+
+        // Check if this bookmark has any remote tracking
+        let is_tracked = !remote_refs.is_empty();
+
+        // Check if local is ahead of remote
+        // Local is ahead if local target differs from any remote target
+        let is_ahead_of_remote = is_tracked
+            && remote_refs.iter().any(|(_remote_name, remote_ref)| {
+                local_target != &remote_ref.target
+            });
+
+        // Check if local is behind remote
+        // Local is behind if local is absent but remote has a target
+        let is_behind_remote = is_tracked
+            && local_target.is_absent()
+            && remote_refs.iter().any(|(_remote_name, remote_ref)| {
+                remote_ref.target.is_present()
+            });
+
+        result.push(BookmarkState {
+            name: name.as_str().to_string(),
+            is_tracked,
+            is_ahead_of_remote,
+            is_behind_remote,
+        });
+    }
+
+    result
 }
