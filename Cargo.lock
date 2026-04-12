@@ -1578,6 +1578,7 @@ dependencies = [
  "pollster",
  "tree-sitter",
  "tree-sitter-rust",
+ "walkdir",
 ]
 
 [[package]]
