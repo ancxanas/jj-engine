@@ -81,7 +81,6 @@ pub struct BookmarkState {
 pub fn inspect(path: &Path) -> Result<RepoState> {
     // Canonicalize path so all output uses absolute paths
     let path = path.canonicalize()?;
-    let path = path.as_path();
 
     // Build config and settings
     let config = StackedConfig::with_defaults();
@@ -92,7 +91,7 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     // Open workspace
     let mut workspace = Workspace::load(
         &settings,
-        path,
+        &path,
         &store_factories,
         &working_copy_factories,
     )?;
@@ -229,7 +228,7 @@ fn collect_bookmarks(repo: &dyn Repo, wc_commit_id: &jj_lib::backend::CommitId) 
             });
 
         result.push(BookmarkState {
-            name: name.as_str().to_string(),
+            name: name.into(),
             is_tracked,
             is_ahead_of_remote,
             is_behind_remote,
