@@ -1,8 +1,8 @@
 //! Semantic/AST project understanding layer.
 //! Uses tree-sitter to parse source files and extract code entities.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -89,6 +89,9 @@ impl SemanticSnapshot {
 /// Scans an entire project and builds a SemanticSnapshot.
 /// Only scans Rust files for now.
 pub fn snapshot_project(root: &Path) -> Result<SemanticSnapshot> {
+    let root = root.canonicalize()?;
+    let root = root.as_path();
+
     let mut entities: HashMap<EntityPath, EntityInfo> = HashMap::new();
     let mut files_scanned = 0;
 
@@ -135,7 +138,6 @@ pub fn snapshot_project(root: &Path) -> Result<SemanticSnapshot> {
         files_scanned,
     })
 }
-
 
 /// Parses a Rust source file and extracts code entities.
 pub fn parse_file(path: &Path, source: &str) -> Result<Vec<EntityInfo>> {
@@ -186,8 +188,7 @@ pub fn parse_file(path: &Path, source: &str) -> Result<Vec<EntityInfo>> {
                 }
             }
             "const_item" | "static_item" => {
-                if let Some(entity) =
-                    extract_named_item(path, child, source, EntityKind::Constant)
+                if let Some(entity) = extract_named_item(path, child, source, EntityKind::Constant)
                 {
                     entities.push(entity);
                 }
@@ -281,11 +282,7 @@ fn extract_named_item(
 }
 
 /// Extracts an impl block.
-fn extract_impl(
-    file: &Path,
-    node: tree_sitter::Node,
-    source: &str,
-) -> Option<EntityInfo> {
+fn extract_impl(file: &Path, node: tree_sitter::Node, source: &str) -> Option<EntityInfo> {
     let type_node = node.child_by_field_name("type")?;
     let name = format!("impl {}", node_text(type_node, source));
     let full_text = node_text(node, source);
@@ -308,11 +305,7 @@ fn extract_impl(
 }
 
 /// Extracts a use/import declaration.
-fn extract_import(
-    file: &Path,
-    node: tree_sitter::Node,
-    source: &str,
-) -> Option<EntityInfo> {
+fn extract_import(file: &Path, node: tree_sitter::Node, source: &str) -> Option<EntityInfo> {
     let full_text = node_text(node, source);
     let hash = hash_str(full_text);
 
@@ -343,4 +336,137 @@ fn hash_str(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+/// The type of change that occurred to an entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticChangeType {
+    /// Entity was added (exists in new, not in old).
+    Added,
+    /// Entity was removed (exists in old, not in new).
+    Removed,
+    /// Entity signature changed (name, params, return type, fields).
+    SignatureChanged,
+    /// Entity implementation changed (body only, signature same).
+    ImplementationChanged,
+}
+
+/// A single semantic change to one entity.
+#[derive(Debug, Clone)]
+pub struct SemanticChange {
+    /// The entity that changed.
+    pub entity: EntityPath,
+
+    /// What kind of change occurred.
+    pub change_type: SemanticChangeType,
+
+    /// Whether this entity is public (for breaking change detection).
+    pub is_public: bool,
+}
+
+/// The full semantic diff between two snapshots.
+#[derive(Debug, Clone)]
+pub struct SemanticDiff {
+    /// All changes detected.
+    pub changes: Vec<SemanticChange>,
+}
+
+impl SemanticDiff {
+    /// Returns true if no changes were detected.
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// Returns all added entities.
+    pub fn added(&self) -> Vec<&SemanticChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.change_type == SemanticChangeType::Added)
+            .collect()
+    }
+
+    /// Returns all removed entities.
+    pub fn removed(&self) -> Vec<&SemanticChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.change_type == SemanticChangeType::Removed)
+            .collect()
+    }
+
+    /// Returns all entities with signature changes.
+    pub fn signature_changed(&self) -> Vec<&SemanticChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.change_type == SemanticChangeType::SignatureChanged)
+            .collect()
+    }
+
+    /// Returns all entities with implementation changes.
+    pub fn implementation_changed(&self) -> Vec<&SemanticChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.change_type == SemanticChangeType::ImplementationChanged)
+            .collect()
+    }
+
+    /// Returns true if any public entity had a signature change.
+    /// This indicates a potentially breaking change.
+    pub fn has_breaking_changes(&self) -> bool {
+        self.changes.iter().any(|c| {
+            c.is_public
+                && (c.change_type == SemanticChangeType::SignatureChanged
+                    || c.change_type == SemanticChangeType::Removed)
+        })
+    }
+}
+
+/// Compares two snapshots and produces a semantic diff.
+pub fn diff_snapshots(old: &SemanticSnapshot, new: &SemanticSnapshot) -> SemanticDiff {
+    let mut changes = Vec::new();
+
+    // Check for removed and modified entities
+    for (path, old_entity) in &old.entities {
+        match new.entities.get(path) {
+            None => {
+                // Entity was removed
+                changes.push(SemanticChange {
+                    entity: path.clone(),
+                    change_type: SemanticChangeType::Removed,
+                    is_public: old_entity.is_public,
+                });
+            }
+            Some(new_entity) => {
+                // Entity exists in both — check for changes
+                if old_entity.signature_hash != new_entity.signature_hash {
+                    // Signature changed
+                    changes.push(SemanticChange {
+                        entity: path.clone(),
+                        change_type: SemanticChangeType::SignatureChanged,
+                        is_public: new_entity.is_public,
+                    });
+                } else if old_entity.body_hash != new_entity.body_hash {
+                    // Only body changed
+                    changes.push(SemanticChange {
+                        entity: path.clone(),
+                        change_type: SemanticChangeType::ImplementationChanged,
+                        is_public: new_entity.is_public,
+                    });
+                }
+                // else: unchanged, skip
+            }
+        }
+    }
+
+    // Check for added entities
+    for (path, new_entity) in &new.entities {
+        if !old.entities.contains_key(path) {
+            changes.push(SemanticChange {
+                entity: path.clone(),
+                change_type: SemanticChangeType::Added,
+                is_public: new_entity.is_public,
+            });
+        }
+    }
+
+    SemanticDiff { changes }
 }
