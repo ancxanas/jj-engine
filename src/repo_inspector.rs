@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use futures::StreamExt as _;
+use jj_lib::backend::TreeValue;
 use jj_lib::config::StackedConfig;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
@@ -16,6 +17,7 @@ use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
 use jj_lib::workspace::default_working_copy_factories;
 use pollster::FutureExt as _;
+use tokio::io::AsyncReadExt;
 
 /// The state of a JJ repository at a point in time.
 /// Purely descriptive. No decisions made here.
@@ -89,12 +91,8 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let working_copy_factories = default_working_copy_factories();
 
     // Open workspace
-    let mut workspace = Workspace::load(
-        &settings,
-        &path,
-        &store_factories,
-        &working_copy_factories,
-    )?;
+    let mut workspace =
+        Workspace::load(&settings, &path, &store_factories, &working_copy_factories)?;
 
     // Load repo at latest operation
     let repo = workspace.repo_loader().load_at_head().block_on()?;
@@ -177,9 +175,9 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
 
     // Determine if safe to rewrite
     // Not safe if any bookmark tracking a remote points to current commit
-    let is_safe_to_rewrite = !bookmarks.iter().any(|b| {
-        b.is_tracked && !b.is_ahead_of_remote && !b.is_behind_remote
-    });
+    let is_safe_to_rewrite = !bookmarks
+        .iter()
+        .any(|b| b.is_tracked && !b.is_ahead_of_remote && !b.is_behind_remote);
 
     let root = workspace.workspace_root().to_path_buf();
 
@@ -201,7 +199,10 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
 }
 
 /// Reads all bookmarks and determines their tracking state.
-fn collect_bookmarks(repo: &dyn Repo, wc_commit_id: &jj_lib::backend::CommitId) -> Vec<BookmarkState> {
+fn collect_bookmarks(
+    repo: &dyn Repo,
+    wc_commit_id: &jj_lib::backend::CommitId,
+) -> Vec<BookmarkState> {
     let view = repo.view();
     let mut result = Vec::new();
 
@@ -215,17 +216,17 @@ fn collect_bookmarks(repo: &dyn Repo, wc_commit_id: &jj_lib::backend::CommitId) 
         // Check if local is ahead of remote
         // Local is ahead if local target differs from any remote target
         let is_ahead_of_remote = is_tracked
-            && remote_refs.iter().any(|(_remote_name, remote_ref)| {
-                local_target != &remote_ref.target
-            });
+            && remote_refs
+                .iter()
+                .any(|(_remote_name, remote_ref)| local_target != &remote_ref.target);
 
         // Check if local is behind remote
         // Local is behind if local is absent but remote has a target
         let is_behind_remote = is_tracked
             && local_target.is_absent()
-            && remote_refs.iter().any(|(_remote_name, remote_ref)| {
-                remote_ref.target.is_present()
-            });
+            && remote_refs
+                .iter()
+                .any(|(_remote_name, remote_ref)| remote_ref.target.is_present());
 
         result.push(BookmarkState {
             name: name.into(),
@@ -236,4 +237,101 @@ fn collect_bookmarks(repo: &dyn Repo, wc_commit_id: &jj_lib::backend::CommitId) 
     }
 
     result
+}
+
+/// Builds a SemanticSnapshot from the committed tree of the current commit.
+/// This represents the "before" state — what was last committed.
+/// Builds a SemanticSnapshot from the committed tree of the current commit.
+/// This represents the "before" state — what was last committed.
+pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapshot> {
+    // Canonicalize path
+    let path = path.canonicalize()?;
+    let path = path.as_path();
+
+    // Build config and settings
+    let config = StackedConfig::with_defaults();
+    let settings = UserSettings::from_config(config)?;
+    let store_factories = StoreFactories::default();
+    let working_copy_factories = default_working_copy_factories();
+
+    // Open workspace
+    let workspace = Workspace::load(&settings, path, &store_factories, &working_copy_factories)?;
+
+    // Load repo at latest operation
+    let repo = workspace.repo_loader().load_at_head().block_on()?;
+    let workspace_name = workspace.workspace_name().to_owned();
+
+    // Get working copy commit
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?
+        .clone();
+
+    let store = repo.store();
+    let commit = store.get_commit(&wc_commit_id)?;
+
+    // Get committed tree
+    let committed_tree = commit.tree();
+
+    // Walk all entries in committed tree
+    let mut entities = std::collections::HashMap::new();
+    let mut files_scanned = 0;
+
+    // Create a tokio runtime to run async file reads
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    for (repo_path, value_result) in committed_tree.entries() {
+        let merged_value = value_result?;
+
+        // Get resolved value, skip conflicts
+        let tree_value = match merged_value.as_normal() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Only process regular files
+        let file_id = match tree_value {
+            TreeValue::File { id, .. } => id.clone(),
+            _ => continue,
+        };
+
+        // Only process Rust files for now
+        let file_name = repo_path.as_internal_file_string().to_string();
+        if !file_name.ends_with(".rs") {
+            continue;
+        }
+
+        // Read file content from committed tree using tokio runtime
+        let content = rt.block_on(async {
+            let mut reader = store.read_file(&repo_path, &file_id).await?;
+
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await?;
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        })?;
+
+        // Convert to string, skip non-utf8 files
+        let source = match String::from_utf8(content) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        files_scanned += 1;
+
+        // Parse file into entities
+        let fs_path = path.join(&file_name);
+        let file_entities = crate::semantic::parse_file(&fs_path, &source)?;
+
+        for entity in file_entities {
+            entities.insert(entity.path.clone(), entity);
+        }
+    }
+
+    Ok(crate::semantic::SemanticSnapshot {
+        entities,
+        files_scanned,
+    })
 }
