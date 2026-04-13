@@ -57,13 +57,20 @@ pub struct EntityInfo {
     /// End line in the source file (zero-indexed).
     pub line_end: usize,
 
-    /// Hash of the entity signature (name + params + return type).
-    /// Used to detect signature changes.
+    /// Hash of the entity signature.
     pub signature_hash: u64,
 
     /// Hash of the full entity body.
-    /// Used to detect implementation changes.
     pub body_hash: u64,
+
+    /// Function and method names called by this entity.
+    pub calls: Vec<String>,
+
+    /// Type names referenced by this entity.
+    pub uses_types: Vec<String>,
+
+    /// Import paths this entity depends on.
+    pub imports: Vec<String>,
 }
 
 /// A snapshot of all code entities in a project at a point in time.
@@ -229,6 +236,19 @@ fn extract_function(
         ""
     };
 
+    // Extract dependencies from body
+    let calls = if let Some(body) = body_node {
+        extract_calls(body, source)
+    } else {
+        Vec::new()
+    };
+
+    let uses_types = if let Some(body) = body_node {
+        extract_types(body, source)
+    } else {
+        Vec::new()
+    };
+
     let kind = if is_test {
         EntityKind::Test
     } else {
@@ -249,6 +269,9 @@ fn extract_function(
         line_end: node.end_position().row,
         signature_hash: hash_str(signature_text),
         body_hash: hash_str(body_text),
+        calls,
+        uses_types,
+        imports: Vec::new(), // populated separately
     })
 }
 
@@ -264,6 +287,12 @@ fn extract_named_item(
     let is_public = node_text(node, source).starts_with("pub");
     let full_text = node_text(node, source);
 
+    // Extract type references but filter out self reference
+    let uses_types = extract_types(node, source)
+        .into_iter()
+        .filter(|t| t != &name)
+        .collect();
+
     let path = EntityPath {
         file: file.to_path_buf(),
         name: name.clone(),
@@ -278,6 +307,9 @@ fn extract_named_item(
         line_end: node.end_position().row,
         signature_hash: hash_str(full_text),
         body_hash: hash_str(full_text),
+        calls: Vec::new(),
+        uses_types,
+        imports: Vec::new(),
     })
 }
 
@@ -286,6 +318,9 @@ fn extract_impl(file: &Path, node: tree_sitter::Node, source: &str) -> Option<En
     let type_node = node.child_by_field_name("type")?;
     let name = format!("impl {}", node_text(type_node, source));
     let full_text = node_text(node, source);
+
+    let calls = extract_calls(node, source);
+    let uses_types = extract_types(node, source);
 
     let path = EntityPath {
         file: file.to_path_buf(),
@@ -301,6 +336,9 @@ fn extract_impl(file: &Path, node: tree_sitter::Node, source: &str) -> Option<En
         line_end: node.end_position().row,
         signature_hash: hash_str(&name),
         body_hash: hash_str(full_text),
+        calls,
+        uses_types,
+        imports: Vec::new(),
     })
 }
 
@@ -308,6 +346,14 @@ fn extract_impl(file: &Path, node: tree_sitter::Node, source: &str) -> Option<En
 fn extract_import(file: &Path, node: tree_sitter::Node, source: &str) -> Option<EntityInfo> {
     let full_text = node_text(node, source);
     let hash = hash_str(full_text);
+
+    // Extract the import path (strip "use " and ";")
+    let import_path = full_text
+        .trim_start_matches("pub ")
+        .trim_start_matches("use ")
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
 
     let path = EntityPath {
         file: file.to_path_buf(),
@@ -323,6 +369,9 @@ fn extract_import(file: &Path, node: tree_sitter::Node, source: &str) -> Option<
         line_end: node.end_position().row,
         signature_hash: hash,
         body_hash: hash,
+        calls: Vec::new(),
+        uses_types: Vec::new(),
+        imports: vec![import_path],
     })
 }
 
@@ -469,4 +518,148 @@ pub fn diff_snapshots(old: &SemanticSnapshot, new: &SemanticSnapshot) -> Semanti
     }
 
     SemanticDiff { changes }
+}
+
+/// Recursively walks a node and collects all function call names.
+fn extract_calls(node: tree_sitter::Node, source: &str) -> Vec<String> {
+    let mut calls = Vec::new();
+    collect_calls(node, source, &mut calls);
+    calls.sort();
+    calls.dedup();
+    calls.retain(|c| !is_common_call(c));
+    calls
+}
+
+/// Recursive helper for extracting calls.
+fn collect_calls(node: tree_sitter::Node, source: &str, calls: &mut Vec<String>) {
+    if node.kind() == "call_expression" {
+        if let Some(func_node) = node.child_by_field_name("function") {
+            match func_node.kind() {
+                "identifier" => {
+                    calls.push(node_text(func_node, source).to_string());
+                }
+                "scoped_identifier" => {
+                    // foo::bar → take only "bar"
+                    let text = node_text(func_node, source);
+                    if let Some(last) = text.split("::").last() {
+                        if !last.is_empty() {
+                            calls.push(last.to_string());
+                        }
+                    }
+                }
+                "field_expression" => {
+                    // self.foo or x.foo → take only field name
+                    if let Some(field) = func_node.child_by_field_name("field") {
+                        calls.push(node_text(field, source).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(child, source, calls);
+    }
+}
+
+/// Recursively walks a node and collects all type identifier names.
+fn extract_types(node: tree_sitter::Node, source: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    collect_types(node, source, &mut types);
+    types.sort();
+    types.dedup();
+    types
+}
+
+/// Recursive helper for extracting type references.
+fn collect_types(node: tree_sitter::Node, source: &str, types: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, source).to_string();
+            // Skip primitive types
+            if !is_primitive_type(&name) {
+                types.push(name);
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_types(child, source, types);
+    }
+}
+
+/// Returns true if the type name is a Rust primitive.
+fn is_primitive_type(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "char"
+            | "str"
+            | "String"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+    )
+}
+
+fn is_common_call(name: &str) -> bool {
+    matches!(
+        name,
+        "Ok" | "Err"
+            | "Some"
+            | "None"
+            | "new"
+            | "default"
+            | "clone"
+            | "into"
+            | "from"
+            | "to_string"
+            | "to_owned"
+            | "as_ref"
+            | "as_path"
+            | "push"
+            | "pop"
+            | "iter"
+            | "collect"
+            | "map"
+            | "filter"
+            | "any"
+            | "all"
+            | "find"
+            | "is_empty"
+            | "len"
+            | "first"
+            | "last"
+            | "unwrap"
+            | "expect"
+            | "ok_or_else"
+            | "join"
+            | "display"
+            | "format"
+    )
 }
