@@ -201,8 +201,53 @@ pub fn parse_file(path: &Path, source: &str) -> Result<Vec<EntityInfo>> {
                 }
             }
             "mod_item" => {
+                // Extract the module itself
                 if let Some(entity) = extract_named_item(path, child, source, EntityKind::Module) {
                     entities.push(entity);
+                }
+
+                // Recurse into module body to extract inner items
+                if let Some(body) = child.child_by_field_name("body") {
+                    // Check if this is a test module
+                    let is_test_mod = is_test_module(child, source);
+
+                    let mut body_cursor = body.walk();
+                    for inner in body.named_children(&mut body_cursor) {
+                        match inner.kind() {
+                            "function_item" => {
+                                if let Some(entity) =
+                                    extract_function(path, inner, source, is_test_mod)
+                                {
+                                    entities.push(entity);
+                                }
+                            }
+                            "struct_item" => {
+                                if let Some(entity) =
+                                    extract_named_item(path, inner, source, EntityKind::Struct)
+                                {
+                                    entities.push(entity);
+                                }
+                            }
+                            "enum_item" => {
+                                if let Some(entity) =
+                                    extract_named_item(path, inner, source, EntityKind::Enum)
+                                {
+                                    entities.push(entity);
+                                }
+                            }
+                            "impl_item" => {
+                                if let Some(entity) = extract_impl(path, inner, source) {
+                                    entities.push(entity);
+                                }
+                            }
+                            "use_declaration" => {
+                                if let Some(entity) = extract_import(path, inner, source) {
+                                    entities.push(entity);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             _ => {}
@@ -223,6 +268,19 @@ fn extract_function(
     let name = node_text(name_node, source).to_string();
     let is_public = node_text(node, source).starts_with("pub");
 
+    // Check if function itself has #[test] attribute
+    let has_test_attr = if let Some(prev) = node.prev_sibling() {
+        if prev.kind() == "attribute_item" {
+            node_text(prev, source).contains("test")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let is_test = is_test || has_test_attr;
+
     let body_node = node.child_by_field_name("body");
     let signature_text = if let Some(body) = body_node {
         &source[node.start_byte()..body.start_byte()]
@@ -236,7 +294,6 @@ fn extract_function(
         ""
     };
 
-    // Extract dependencies from body
     let calls = if let Some(body) = body_node {
         extract_calls(body, source)
     } else {
@@ -271,7 +328,7 @@ fn extract_function(
         body_hash: hash_str(body_text),
         calls,
         uses_types,
-        imports: Vec::new(), // populated separately
+        imports: Vec::new(),
     })
 }
 
@@ -373,6 +430,25 @@ fn extract_import(file: &Path, node: tree_sitter::Node, source: &str) -> Option<
         uses_types: Vec::new(),
         imports: vec![import_path],
     })
+}
+
+/// Checks if a module node has #[cfg(test)] attribute.
+fn is_test_module(node: tree_sitter::Node, source: &str) -> bool {
+    // Check previous sibling for #[cfg(test)] attribute
+    if let Some(prev) = node.prev_sibling() {
+        if prev.kind() == "attribute_item" {
+            let text = node_text(prev, source);
+            return text.contains("cfg(test)");
+        }
+    }
+
+    // Also check if module name is "tests"
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let name = node_text(name_node, source);
+        return name == "tests" || name == "test";
+    }
+
+    false
 }
 
 /// Gets the source text of a node.
@@ -532,38 +608,56 @@ fn extract_calls(node: tree_sitter::Node, source: &str) -> Vec<String> {
 
 /// Recursive helper for extracting calls.
 fn collect_calls(node: tree_sitter::Node, source: &str, calls: &mut Vec<String>) {
-    if node.kind() == "call_expression" {
-        if let Some(func_node) = node.child_by_field_name("function") {
-            match func_node.kind() {
-                "identifier" => {
-                    calls.push(node_text(func_node, source).to_string());
+    match node.kind() {
+        "call_expression" => {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                match func_node.kind() {
+                    "identifier" => {
+                        calls.push(node_text(func_node, source).to_string());
+                    }
+                    "scoped_identifier" => {
+                        let text = node_text(func_node, source);
+                        if let Some(last) = text.split("::").last() {
+                            if !last.is_empty() {
+                                calls.push(last.to_string());
+                            }
+                        }
+                    }
+                    "field_expression" => {
+                        if let Some(field) = func_node.child_by_field_name("field") {
+                            calls.push(node_text(field, source).to_string());
+                        }
+                    }
+                    _ => {}
                 }
-                "scoped_identifier" => {
-                    // foo::bar → take only "bar"
-                    let text = node_text(func_node, source);
-                    if let Some(last) = text.split("::").last() {
-                        if !last.is_empty() {
-                            calls.push(last.to_string());
+            }
+        }
+        "token_tree" => {
+            // Inside macro invocations, look for identifier followed by (
+            // Pattern: identifier "(" = likely a function call
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.children(&mut cursor).collect();
+            for i in 0..children.len() {
+                if children[i].kind() == "identifier" {
+                    // Check if next non-whitespace sibling is "("
+                    if i + 1 < children.len() && children[i + 1].kind() == "token_tree" {
+                        let name = node_text(children[i], source).to_string();
+                        if !is_common_call(&name) {
+                            calls.push(name);
                         }
                     }
                 }
-                "field_expression" => {
-                    // self.foo or x.foo → take only field name
-                    if let Some(field) = func_node.child_by_field_name("field") {
-                        calls.push(node_text(field, source).to_string());
-                    }
-                }
-                _ => {}
             }
         }
+        _ => {}
     }
 
+    // Recurse into all children
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_calls(child, source, calls);
     }
 }
-
 /// Recursively walks a node and collects all type identifier names.
 fn extract_types(node: tree_sitter::Node, source: &str) -> Vec<String> {
     let mut types = Vec::new();
