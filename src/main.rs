@@ -263,6 +263,165 @@ fn main() {
             }
         }
 
+        "graph" => {
+            if args.len() < 3 {
+                eprintln!("usage: jj-engine graph <project-path>");
+                std::process::exit(1);
+            }
+
+            let project_path = Path::new(&args[2]);
+
+            // Build snapshot
+            let snapshot = match semantic::snapshot_project(project_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!("Building dependency graph for {}\n", project_path.display());
+
+            // Build graph
+            let graph = work_inference::build_graph(&snapshot);
+
+            println!("Entities: {}", snapshot.entities.len());
+            println!("Edges: {}\n", graph.edge_count());
+
+            // Print edges
+            println!("Dependencies:\n");
+            for (entity, deps) in &graph.forward {
+                if deps.is_empty() {
+                    continue;
+                }
+                println!("  {} ({:?})", entity.name, entity.kind);
+                for dep in deps {
+                    println!("    → {} ({:?})", dep.name, dep.kind);
+                }
+            }
+
+            // Also show connected components if diffing
+            // Use all non-import entities as "changed" for demo
+            let all_entities: Vec<semantic::EntityPath> = snapshot
+                .entities
+                .keys()
+                .filter(|p| p.kind != semantic::EntityKind::Import)
+                .cloned()
+                .collect();
+
+            let components = work_inference::find_connected_components(&all_entities, &graph);
+
+            println!("\nConnected components ({}):\n", components.len());
+            for (i, component) in components.iter().enumerate() {
+                println!("  Component {} ({} entities):", i + 1, component.len());
+                for entity in component {
+                    println!("    {} ({:?})", entity.name, entity.kind);
+                }
+            }
+        }
+
+        "work-units" => {
+            if args.len() < 3 {
+                eprintln!("usage: jj-engine work-units <repo-path>");
+                std::process::exit(1);
+            }
+
+            let repo_path = Path::new(&args[2]);
+
+            println!("Inferring work units for {}\n", repo_path.display());
+
+            // Build before snapshot from committed tree
+            let before = match repo_inspector::committed_snapshot(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building committed snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Build after snapshot from working copy
+            let after = match semantic::snapshot_project(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building working copy snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Compute semantic diff
+            let diff = semantic::diff_snapshots(&before, &after);
+
+            if diff.is_empty() {
+                println!("No semantic changes detected. Nothing to do.");
+                return;
+            }
+
+            // Build dependency graph from working copy snapshot
+            let graph = work_inference::build_graph(&after);
+
+            // Collect changed entities (excluding imports for now)
+            let changed_entities: Vec<semantic::EntityPath> = diff
+                .changes
+                .iter()
+                .filter(|c| {
+                    c.entity.kind != semantic::EntityKind::Import
+                        && c.entity.kind != semantic::EntityKind::Module
+                })
+                .map(|c| c.entity.clone())
+                .collect();
+
+            // Find connected components among changed entities
+            let components = work_inference::find_connected_components(&changed_entities, &graph);
+
+            // Classify into work units
+            let units = work_inference::classify_work_units(components, &diff, &after);
+
+            println!("Work units found: {}\n", units.len());
+
+            for unit in &units {
+                println!(
+                    "  Unit {} [{:?}]{}",
+                    unit.id,
+                    unit.kind,
+                    unit.related_to
+                        .map(|id| format!(" (tests unit {})", id))
+                        .unwrap_or_default()
+                );
+
+                println!("  Entities:");
+                for entity in &unit.entities {
+                    let change_type = unit
+                        .changes
+                        .iter()
+                        .find(|c| &c.entity == entity)
+                        .map(|c| format!("{:?}", c.change_type))
+                        .unwrap_or_else(|| "Unknown".to_string());
+
+                    println!("    {} ({:?}) — {}", entity.name, entity.kind, change_type,);
+                }
+                println!();
+            }
+
+            // Report untested features
+            let untested = work_inference::find_untested_features(&units);
+            if !untested.is_empty() {
+                println!("⚠ Untested features (no test unit linked):");
+                for id in &untested {
+                    if let Some(unit) = units.iter().find(|u| u.id == *id) {
+                        println!(
+                            "  Unit {}: {}",
+                            id,
+                            unit.entities
+                                .iter()
+                                .map(|e| e.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+            }
+        }
+
         // Default: repo inspection mode
         _ => {
             let path = Path::new(&args[1]);
