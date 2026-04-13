@@ -47,6 +47,15 @@ fn main() {
                             entity.is_public,
                             entity.is_test,
                         );
+                        if !entity.calls.is_empty() {
+                            println!("    calls:      {:?}", entity.calls);
+                        }
+                        if !entity.uses_types.is_empty() {
+                            println!("    uses types: {:?}", entity.uses_types);
+                        }
+                        if !entity.imports.is_empty() {
+                            println!("    imports:    {:?}", entity.imports);
+                        }
                     }
                     println!();
                     println!("Total: {} entities", entities.len());
