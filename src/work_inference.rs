@@ -109,11 +109,49 @@ pub fn build_graph(snapshot: &SemanticSnapshot) -> DependencyGraph {
         name_lookup.entry(&path.name).or_default().push(path);
     }
 
-    // For each entity, resolve calls and type references into edges
+    // Build file → imports lookup
+    // Collects all import paths declared in each file
+    let mut file_imports: HashMap<&std::path::PathBuf, Vec<&String>> = HashMap::new();
     for (path, entity) in &snapshot.entities {
+        if path.kind == crate::semantic::EntityKind::Import {
+            for imp in &entity.imports {
+                file_imports.entry(&path.file).or_default().push(imp);
+            }
+        }
+    }
+
+    // For each entity resolve calls and type references into edges
+    for (path, entity) in &snapshot.entities {
+        // Get imports for this entity's file
+        let file_imp_list = file_imports
+            .get(&path.file)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        // Resolve function calls
         for call_name in &entity.calls {
             if let Some(targets) = name_lookup.get(call_name.as_str()) {
-                for target in targets {
+                // Filter to targets whose file matches an import in caller's file
+                let filtered: Vec<&EntityPath> = targets
+                    .iter()
+                    .filter(|t| {
+                        file_imp_list.iter().any(|imp| {
+                            let file_name =
+                                t.file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            imp.contains(file_name)
+                        })
+                    })
+                    .copied()
+                    .collect();
+
+                // Use filtered if we found import matches, otherwise use all
+                let resolved: &[&EntityPath] = if filtered.is_empty() {
+                    targets
+                } else {
+                    &filtered
+                };
+
+                for target in resolved {
                     if *target != path {
                         graph.add_edge(path.clone(), (*target).clone());
                     }
@@ -121,9 +159,28 @@ pub fn build_graph(snapshot: &SemanticSnapshot) -> DependencyGraph {
             }
         }
 
+        // Resolve type references
         for type_name in &entity.uses_types {
             if let Some(targets) = name_lookup.get(type_name.as_str()) {
-                for target in targets {
+                let filtered: Vec<&EntityPath> = targets
+                    .iter()
+                    .filter(|t| {
+                        file_imp_list.iter().any(|imp| {
+                            let file_name =
+                                t.file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            imp.contains(file_name)
+                        })
+                    })
+                    .copied()
+                    .collect();
+
+                let resolved: &[&EntityPath] = if filtered.is_empty() {
+                    targets
+                } else {
+                    &filtered
+                };
+
+                for target in resolved {
                     if *target != path {
                         graph.add_edge(path.clone(), (*target).clone());
                     }
@@ -134,7 +191,6 @@ pub fn build_graph(snapshot: &SemanticSnapshot) -> DependencyGraph {
 
     graph
 }
-
 /// Finds connected components among the given changed entities.
 pub fn find_connected_components(
     changed: &[EntityPath],
