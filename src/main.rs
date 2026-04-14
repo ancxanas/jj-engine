@@ -305,10 +305,11 @@ fn main() {
             let all_entities: Vec<semantic::EntityPath> = snapshot
                 .entities
                 .keys()
-                .filter(|p| p.kind != semantic::EntityKind::Import)
+                .filter(|p| {
+                    p.kind != semantic::EntityKind::Import && p.kind != semantic::EntityKind::Module
+                })
                 .cloned()
                 .collect();
-
             let components = work_inference::find_connected_components(&all_entities, &graph);
 
             println!("\nConnected components ({}):\n", components.len());
@@ -418,6 +419,124 @@ fn main() {
                                 .join(", ")
                         );
                     }
+                }
+            }
+        }
+
+        "plan" => {
+            if args.len() < 3 {
+                eprintln!("usage: jj-engine plan <repo-path>");
+                std::process::exit(1);
+            }
+
+            let repo_path = Path::new(&args[2]);
+
+            println!("Planning actions for {}\n", repo_path.display());
+
+            // Read repo state
+            let repo_state = match repo_inspector::inspect(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading repo state: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!("--- Repo State ---");
+            println!("safe to rewrite:   {}", repo_state.is_safe_to_rewrite);
+            println!("empty commit:      {}", repo_state.is_empty_commit);
+            println!("has conflicts:     {}", repo_state.has_conflicts);
+            println!("has changes:       {}", repo_state.has_changes);
+
+            // Build snapshots and diff
+            let before = match repo_inspector::committed_snapshot(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building committed snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let after = match semantic::snapshot_project(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building working copy snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let diff = semantic::diff_snapshots(&before, &after);
+
+            if diff.is_empty() && !repo_state.has_changes {
+                println!("\nNo changes detected. Nothing to plan.");
+                return;
+            }
+
+            // Build dependency graph and infer work units
+            let graph = work_inference::build_graph(&after);
+
+            let changed_entities: Vec<semantic::EntityPath> = diff
+                .changes
+                .iter()
+                .filter(|c| {
+                    c.entity.kind != semantic::EntityKind::Import
+                        && c.entity.kind != semantic::EntityKind::Module
+                })
+                .map(|c| c.entity.clone())
+                .collect();
+
+            let components = work_inference::find_connected_components(&changed_entities, &graph);
+
+            let units = work_inference::classify_work_units(components, &diff, &after);
+
+            println!("\n--- Work Units ---");
+            for unit in &units {
+                let names: Vec<&str> = unit.entities.iter().map(|e| e.name.as_str()).collect();
+                println!("Unit {} [{:?}]: {}", unit.id, unit.kind, names.join(", "),);
+            }
+
+            // Run decision engine
+            let plan = decision::decide(&repo_state, &units);
+
+            println!("\n--- Action Plan ---");
+            match &plan.action {
+                decision::JjAction::NoOp => {
+                    println!("No action needed.");
+                }
+                decision::JjAction::RequireHumanIntervention { reason } => {
+                    println!("⛔ Human intervention required: {}", reason);
+                }
+                decision::JjAction::AmendCommit { message } => {
+                    println!("Action: AmendCommit");
+                    println!("  Message: \"{}\"", message);
+                    println!("  Reason: single change, safe to rewrite");
+                }
+                decision::JjAction::CreateCommit { message } => {
+                    println!("Action: CreateCommit");
+                    println!("  Message: \"{}\"", message);
+                    println!("  Reason: published commit, creating new child");
+                }
+                decision::JjAction::SplitCommit { plans } => {
+                    println!("Action: SplitCommit ({} commits)\n", plans.len());
+                    for plan in plans {
+                        println!(
+                            "  Commit {} (order {}):",
+                            plan.work_unit_ids
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            plan.order,
+                        );
+                        println!("    Message: \"{}\"", plan.message);
+                    }
+                }
+            }
+
+            if !plan.warnings.is_empty() {
+                println!("\n--- Warnings ---");
+                for warning in &plan.warnings {
+                    println!("⚠ {}", warning);
                 }
             }
         }
