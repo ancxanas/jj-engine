@@ -271,7 +271,6 @@ fn main() {
 
             let project_path = Path::new(&args[2]);
 
-            // Build snapshot
             let snapshot = match semantic::snapshot_project(project_path) {
                 Ok(s) => s,
                 Err(e) => {
@@ -282,26 +281,39 @@ fn main() {
 
             println!("Building dependency graph for {}\n", project_path.display());
 
-            // Build graph
             let graph = work_inference::build_graph(&snapshot);
 
             println!("Entities: {}", snapshot.entities.len());
             println!("Edges: {}\n", graph.edge_count());
 
-            // Print edges
             println!("Dependencies:\n");
             for (entity, deps) in &graph.forward {
                 if deps.is_empty() {
                     continue;
                 }
-                println!("  {} ({:?})", entity.name, entity.kind);
+                println!(
+                    "  {} ({:?}) in {}",
+                    entity.name,
+                    entity.kind,
+                    entity
+                        .file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                );
                 for dep in deps {
-                    println!("    → {} ({:?})", dep.name, dep.kind);
+                    println!(
+                        "    → {} ({:?}) in {}",
+                        dep.name,
+                        dep.kind,
+                        dep.file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                    );
                 }
             }
 
-            // Also show connected components if diffing
-            // Use all non-import entities as "changed" for demo
             let all_entities: Vec<semantic::EntityPath> = snapshot
                 .entities
                 .keys()
@@ -310,13 +322,23 @@ fn main() {
                 })
                 .cloned()
                 .collect();
+
             let components = work_inference::find_connected_components(&all_entities, &graph);
 
             println!("\nConnected components ({}):\n", components.len());
             for (i, component) in components.iter().enumerate() {
                 println!("  Component {} ({} entities):", i + 1, component.len());
                 for entity in component {
-                    println!("    {} ({:?})", entity.name, entity.kind);
+                    println!(
+                        "    {} ({:?}) in {}",
+                        entity.name,
+                        entity.kind,
+                        entity
+                            .file
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                    );
                 }
             }
         }
