@@ -658,6 +658,7 @@ fn collect_calls(node: tree_sitter::Node, source: &str, calls: &mut Vec<String>)
         collect_calls(child, source, calls);
     }
 }
+
 /// Recursively walks a node and collects all type identifier names.
 fn extract_types(node: tree_sitter::Node, source: &str) -> Vec<String> {
     let mut types = Vec::new();
@@ -755,5 +756,15 @@ fn is_common_call(name: &str) -> bool {
             | "join"
             | "display"
             | "format"
+            | "Error"
+            | "Result"
+            | "Config"
+            | "tests"
+            | "test"
+            | "main"
+            | "Option"
+            | "Box"
+            | "handle"
+            | "run"
     )
 }
