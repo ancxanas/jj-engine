@@ -396,7 +396,10 @@ fn entity_names(unit: &WorkUnit) -> Vec<String> {
             e.kind != crate::semantic::EntityKind::Import
                 && e.kind != crate::semantic::EntityKind::Module
         })
-        .map(|e| e.name.clone())
+        .map(|e| {
+            let file_stem = e.file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            format!("{}::{}", file_stem, e.name)
+        })
         .collect()
 }
 
