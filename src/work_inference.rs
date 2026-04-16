@@ -100,6 +100,14 @@ impl DependencyGraph {
 }
 
 /// Builds a dependency graph from a semantic snapshot.
+///
+/// For each entity, resolves its `calls` and `uses_types` against
+/// all entities in the snapshot. An edge is created only if:
+/// - the target entity is in the same file, OR
+/// - the caller's file has an import matching the target's file
+///
+/// This prevents false connections between unrelated entities
+/// with the same name in different modules.pub
 pub fn build_graph(snapshot: &SemanticSnapshot) -> DependencyGraph {
     let mut graph = DependencyGraph::empty();
 
@@ -152,6 +160,16 @@ pub fn build_graph(snapshot: &SemanticSnapshot) -> DependencyGraph {
                 }
             }
         }
+    }
+
+    for edges in graph.forward.values_mut() {
+        let mut seen = HashSet::new();
+        edges.retain(|e| seen.insert(e.clone()));
+    }
+
+    for edges in graph.reverse.values_mut() {
+        let mut seen = HashSet::new();
+        edges.retain(|e| seen.insert(e.clone()));
     }
 
     graph
@@ -254,7 +272,7 @@ pub fn classify_work_units(
                 .filter_map(|e| change_lookup.get(e).map(|c| (*c).clone()))
                 .collect();
 
-            let kind = classify_impl_group(&impl_entities, &impl_changes, snapshot);
+            let kind = classify_impl_group(&impl_changes);
 
             let id = next_id;
             next_id += 1;
@@ -298,11 +316,7 @@ pub fn classify_work_units(
 /// Classifies an implementation group into Feature, BugFix, or Refactor.
 ///
 /// Priority: Feature > BugFix > Refactor
-fn classify_impl_group(
-    entities: &[EntityPath],
-    changes: &[SemanticChange],
-    snapshot: &SemanticSnapshot,
-) -> WorkKind {
+fn classify_impl_group(changes: &[SemanticChange]) -> WorkKind {
     // Check for public additions → Feature
     let has_public_addition = changes
         .iter()
