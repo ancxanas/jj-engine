@@ -563,6 +563,108 @@ fn main() {
             }
         }
 
+        "apply" => {
+            if args.len() < 3 {
+                eprintln!("usage: jj-engine apply <repo-path>");
+                std::process::exit(1);
+            }
+
+            let repo_path = Path::new(&args[2]);
+
+            println!("Applying action plan to {}\n", repo_path.display());
+
+            // Read repo state
+            let repo_state = match repo_inspector::inspect(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading repo state: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Build snapshots and diff
+            let before = match repo_inspector::committed_snapshot(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building committed snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let after = match semantic::snapshot_project(repo_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error building working copy snapshot: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let diff = semantic::diff_snapshots(&before, &after);
+
+            if diff.is_empty() && !repo_state.has_changes {
+                println!("No changes detected. Nothing to do.");
+                return;
+            }
+
+            // Build dependency graph and infer work units
+            let graph = work_inference::build_graph(&after);
+
+            let changed_entities: Vec<semantic::EntityPath> = diff
+                .changes
+                .iter()
+                .filter(|c| {
+                    c.entity.kind != semantic::EntityKind::Import
+                        && c.entity.kind != semantic::EntityKind::Module
+                })
+                .map(|c| c.entity.clone())
+                .collect();
+
+            let components = work_inference::find_connected_components(&changed_entities, &graph);
+
+            let units = work_inference::classify_work_units(components, &diff, &after);
+
+            // Run decision engine
+            let plan = decision::decide(&repo_state, &units);
+
+            // Print plan
+            println!(
+                "Action: {:?}\n",
+                match &plan.action {
+                    decision::JjAction::NoOp => "NoOp",
+                    decision::JjAction::AmendCommit { .. } => "AmendCommit",
+                    decision::JjAction::CreateCommit { .. } => "CreateCommit",
+                    decision::JjAction::SplitCommit { .. } => "SplitCommit",
+                    decision::JjAction::RequireHumanIntervention { .. } =>
+                        "RequireHumanIntervention",
+                }
+            );
+
+            // Execute
+            match executor::execute(repo_path, &plan, &units, &after) {
+                Ok(report) => {
+                    if report.success {
+                        for action in &report.actions_executed {
+                            println!("✓ {}", action);
+                        }
+                        if !report.warnings.is_empty() {
+                            println!("\nWarnings:");
+                            for w in &report.warnings {
+                                println!("⚠ {}", w);
+                            }
+                        }
+                        println!("\nExecution complete.");
+                    } else {
+                        eprintln!("Execution blocked: {}", report.error.unwrap_or_default());
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Execution failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         // Default: repo inspection mode
         _ => {
             let path = Path::new(&args[1]);
@@ -596,6 +698,15 @@ fn main() {
                         println!("  (none)");
                     } else {
                         for f in &state.untracked_files {
+                            println!("  {}", f.display());
+                        }
+                    }
+
+                    println!("\nConflicted files:");
+                    if state.conflicted_files.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for f in &state.conflicted_files {
                             println!("  {}", f.display());
                         }
                     }
