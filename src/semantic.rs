@@ -271,7 +271,8 @@ fn extract_function(
     // Check if function itself has #[test] attribute
     let has_test_attr = if let Some(prev) = node.prev_sibling() {
         if prev.kind() == "attribute_item" {
-            node_text(prev, source).contains("test")
+            let text = node_text(prev, source).trim();
+            text == "#[test]"
         } else {
             false
         }
@@ -434,15 +435,16 @@ fn extract_import(file: &Path, node: tree_sitter::Node, source: &str) -> Option<
 
 /// Checks if a module node has #[cfg(test)] attribute.
 fn is_test_module(node: tree_sitter::Node, source: &str) -> bool {
-    // Check previous sibling for #[cfg(test)] attribute
     if let Some(prev) = node.prev_sibling() {
         if prev.kind() == "attribute_item" {
-            let text = node_text(prev, source);
-            return text.contains("cfg(test)");
+            let text = node_text(prev, source).trim();
+            // Match #[cfg(test)] exactly, not substrings
+            if text == "#[cfg(test)]" {
+                return true;
+            }
         }
     }
 
-    // Also check if module name is "tests"
     if let Some(name_node) = node.child_by_field_name("name") {
         let name = node_text(name_node, source);
         return name == "tests" || name == "test";
@@ -687,7 +689,10 @@ fn collect_types(node: tree_sitter::Node, source: &str, types: &mut Vec<String>)
     }
 }
 
-/// Returns true if the type name is a Rust primitive.
+/// Returns true if the type name is a Rust primitive or standard library type
+/// that should not create dependency edges in the graph.
+/// These are filtered because they appear in almost every file
+/// and would create noise in type references.
 fn is_primitive_type(name: &str) -> bool {
     matches!(
         name,
@@ -719,9 +724,14 @@ fn is_primitive_type(name: &str) -> bool {
             | "HashSet"
             | "BTreeMap"
             | "BTreeSet"
+            | "Error"
     )
 }
 
+/// Returns true if the function name is a common standard library call
+/// that should not create dependency edges in the graph.
+/// These are filtered because they appear in almost every function
+/// and would create noise in the dependency graph.
 fn is_common_call(name: &str) -> bool {
     matches!(
         name,

@@ -168,7 +168,7 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let has_changes = !modified_files.is_empty();
 
     // Collect bookmarks
-    let bookmarks = collect_bookmarks(repo.as_ref(), &wc_commit_id);
+    let bookmarks = collect_bookmarks(repo.as_ref());
 
     // Determine if remote exists
     let has_remote = bookmarks.iter().any(|b| b.is_tracked);
@@ -199,10 +199,7 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
 }
 
 /// Reads all bookmarks and determines their tracking state.
-fn collect_bookmarks(
-    repo: &dyn Repo,
-    wc_commit_id: &jj_lib::backend::CommitId,
-) -> Vec<BookmarkState> {
+fn collect_bookmarks(repo: &dyn Repo) -> Vec<BookmarkState> {
     let view = repo.view();
     let mut result = Vec::new();
 
@@ -271,9 +268,14 @@ pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapsh
     let store = repo.store();
     let commit = store.get_commit(&wc_commit_id)?;
 
-    // Get committed tree
-    let committed_tree = commit.tree();
-
+    // Get PARENT commit tree (the "before" state)
+    // The working copy commit IS the current state
+    let parent_id = commit
+        .parent_ids()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no parent commit"))?;
+    let parent_commit = store.get_commit(parent_id)?;
+    let committed_tree = parent_commit.tree();
     // Walk all entries in committed tree
     let mut entities = std::collections::HashMap::new();
     let mut files_scanned = 0;
