@@ -5,9 +5,15 @@
 //! This module is pure logic — no jj-lib calls.
 
 use crate::repo_inspector::RepoState;
+use crate::semantic::EntityKind;
 use crate::semantic::SemanticChangeType;
 use crate::work_inference::WorkKind;
 use crate::work_inference::WorkUnit;
+
+/// Maximum total entity count across refactor units
+/// before we stop merging them into a single commit.
+/// Keeps merged refactor commits small and focused.
+const MAX_REFACTOR_MERGE_ENTITIES: usize = 6;
 
 /// A specific JJ action the engine wants to perform.
 #[derive(Debug, Clone)]
@@ -264,7 +270,7 @@ fn merge_small_refactors(plans: Vec<CommitPlan>, units: &[WorkUnit]) -> Vec<Comm
         .map(|u| u.entities.len())
         .sum();
 
-    if total_refactor_entities > 6 {
+    if total_refactor_entities > MAX_REFACTOR_MERGE_ENTITIES {
         // Too many entities to merge. Keep separate.
         return plans;
     }
@@ -392,10 +398,7 @@ fn generate_combined_message(units: &[WorkUnit]) -> String {
 fn entity_names(unit: &WorkUnit) -> Vec<String> {
     unit.entities
         .iter()
-        .filter(|e| {
-            e.kind != crate::semantic::EntityKind::Import
-                && e.kind != crate::semantic::EntityKind::Module
-        })
+        .filter(|e| e.kind != EntityKind::Import && e.kind != EntityKind::Module)
         .map(|e| {
             let file_stem = e.file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             format!("{}::{}", file_stem, e.name)
@@ -425,7 +428,6 @@ fn format_names(names: &[String]) -> String {
 fn generate_warnings(units: &[WorkUnit]) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // Find untested features
     let test_related_ids: std::collections::HashSet<usize> = units
         .iter()
         .filter(|u| u.kind == WorkKind::Test)
@@ -433,29 +435,27 @@ fn generate_warnings(units: &[WorkUnit]) -> Vec<String> {
         .collect();
 
     for unit in units {
+        // Untested features
         if unit.kind == WorkKind::Feature && !test_related_ids.contains(&unit.id) {
             let names = entity_names(unit);
             warnings.push(format!("feature {} has no tests", format_names(&names)));
         }
-    }
 
-    // Find public signature changes
-    for unit in units {
+        // Public API changes and removals
         for change in &unit.changes {
-            if change.is_public && change.change_type == SemanticChangeType::SignatureChanged {
-                warnings.push(format!(
-                    "public API changed: {} — push may break consumers",
-                    change.entity.name
-                ));
-            }
-        }
-    }
-
-    // Find public removals
-    for unit in units {
-        for change in &unit.changes {
-            if change.is_public && change.change_type == SemanticChangeType::Removed {
-                warnings.push(format!("public entity removed: {}", change.entity.name));
+            if change.is_public {
+                match change.change_type {
+                    SemanticChangeType::SignatureChanged => {
+                        warnings.push(format!(
+                            "public API changed: {} — push may break consumers",
+                            change.entity.name
+                        ));
+                    }
+                    SemanticChangeType::Removed => {
+                        warnings.push(format!("public entity removed: {}", change.entity.name));
+                    }
+                    _ => {}
+                }
             }
         }
     }
