@@ -5,6 +5,7 @@ mod jj_context;
 mod policy;
 mod repo_inspector;
 mod semantic;
+mod session;
 mod work_inference;
 
 use std::path::Path;
@@ -171,8 +172,15 @@ async fn main() {
 
             println!("Computing semantic diff for {:?}\n", repo_path);
 
-            // Build "before" snapshot from committed tree
-            let before = match repo_inspector::committed_snapshot(repo_path).await {
+            let session = match session::RepoSession::load(repo_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error loading repo session: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let before = match repo_inspector::committed_snapshot_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -183,7 +191,7 @@ async fn main() {
             println!("Committed snapshot: {} entities", before.entities.len());
 
             // Build "after" snapshot from working copy files
-            let after = match semantic::snapshot_project(repo_path) {
+            let after = match semantic::snapshot_project(&session.repo_path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building working copy snapshot: {}", e);
@@ -355,8 +363,15 @@ async fn main() {
 
             println!("Inferring work units for {}\n", repo_path.display());
 
-            // Build before snapshot from committed tree
-            let before = match repo_inspector::committed_snapshot(repo_path).await {
+            let session = match session::RepoSession::load(repo_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error loading repo session: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let before = match repo_inspector::committed_snapshot_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -365,7 +380,7 @@ async fn main() {
             };
 
             // Build after snapshot from working copy
-            let after = match semantic::snapshot_project(repo_path) {
+            let after = match semantic::snapshot_project(&session.repo_path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building working copy snapshot: {}", e);
@@ -457,8 +472,15 @@ async fn main() {
 
             println!("Planning actions for {}\n", repo_path.display());
 
-            // Read repo state
-            let repo_state = match repo_inspector::inspect(repo_path).await {
+            let session = match session::RepoSession::load(repo_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error loading repo session: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let repo_state = match repo_inspector::inspect_from_session(&session) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -472,8 +494,7 @@ async fn main() {
             println!("has conflicts:     {}", repo_state.has_conflicts);
             println!("has changes:       {}", repo_state.has_changes);
 
-            // Build snapshots and diff
-            let before = match repo_inspector::committed_snapshot(repo_path).await {
+            let before = match repo_inspector::committed_snapshot_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -481,7 +502,7 @@ async fn main() {
                 }
             };
 
-            let after = match semantic::snapshot_project(repo_path) {
+            let after = match semantic::snapshot_project(&session.repo_path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building working copy snapshot: {}", e);
@@ -575,8 +596,15 @@ async fn main() {
 
             println!("Applying action plan to {}\n", repo_path.display());
 
-            // Read repo state
-            let repo_state = match repo_inspector::inspect(repo_path).await {
+            let session = match session::RepoSession::load(repo_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error loading repo session: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let repo_state = match repo_inspector::inspect_from_session(&session) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -584,8 +612,7 @@ async fn main() {
                 }
             };
 
-            // Build snapshots and diff
-            let before = match repo_inspector::committed_snapshot(repo_path).await {
+            let before = match repo_inspector::committed_snapshot_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -593,7 +620,7 @@ async fn main() {
                 }
             };
 
-            let after = match semantic::snapshot_project(repo_path) {
+            let after = match semantic::snapshot_project(&session.repo_path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building working copy snapshot: {}", e);
@@ -671,7 +698,16 @@ async fn main() {
         _ => {
             let path = Path::new(&args[1]);
             println!("jj-engine: inspecting repo at {:?}", path);
-            match repo_inspector::inspect(path).await {
+
+            let session = match session::RepoSession::load(path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error loading repo session: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            match repo_inspector::inspect_from_session(&session) {
                 Ok(state) => {
                     println!("\n--- Repo State ---");
                     println!("root:              {:?}", state.root);
