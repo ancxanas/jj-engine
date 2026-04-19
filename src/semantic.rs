@@ -1,8 +1,8 @@
 //! Semantic/AST project understanding layer.
 //! Uses tree-sitter to parse source files and extract code entities.
 
+use rustc_hash::FxHasher;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::path::Path;
@@ -460,7 +460,7 @@ fn node_text<'a>(node: tree_sitter::Node, source: &'a str) -> &'a str {
 
 /// Hashes a string to a u64.
 fn hash_str(s: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     s.hash(&mut hasher);
     hasher.finish()
 }
