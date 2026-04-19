@@ -1,17 +1,14 @@
 //! Repository state observation via jj-lib.
 
-use std::path::Path;
-use std::path::PathBuf;
+use crate::session::RepoSession;
 
-use crate::jj_context::JjContext;
 use anyhow::Result;
 use futures::StreamExt as _;
 use jj_lib::backend::TreeValue;
-use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
-use jj_lib::working_copy::SnapshotOptions;
+use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
 /// The state of a JJ repository at a point in time.
@@ -64,6 +61,9 @@ pub struct BookmarkState {
     /// Name of the bookmark.
     pub name: String,
 
+    /// The commit this bookmark points to, if any.
+    pub commit_id: Option<String>,
+
     /// Whether this bookmark tracks a remote.
     pub is_tracked: bool,
 
@@ -74,35 +74,12 @@ pub struct BookmarkState {
     pub is_behind_remote: bool,
 }
 
-/// Opens a JJ workspace at the given path and reads repo state.
-pub async fn inspect(path: &Path) -> Result<RepoState> {
-    // Canonicalize path so all output uses absolute paths
-    let path = path.canonicalize()?;
-
-    // Build config and settings
-    let ctx = JjContext::new()?;
-
-    // Open workspace
-    let mut workspace = ctx.load_workspace(&path)?;
-
-    // Load repo at latest operation
-    let repo = workspace.repo_loader().load_at_head().await?;
-
-    // Get workspace name
-    let workspace_name = workspace.workspace_name().to_owned();
-
-    // Get working copy commit id
-    let wc_commit_id = repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?
-        .clone();
-
-    // Load the commit
+pub fn inspect_from_session(session: &RepoSession) -> Result<RepoState> {
+    let path = session.repo_path.as_path();
+    let repo = &session.repo;
     let store = repo.store();
-    let commit = store.get_commit(&wc_commit_id)?;
+    let commit = store.get_commit(&session.wc_commit_id)?;
 
-    // Read commit info
     let current_commit_id = commit.id().hex();
     let current_change_id = commit.change_id().hex();
 
@@ -113,7 +90,6 @@ pub async fn inspect(path: &Path) -> Result<RepoState> {
         Some(description)
     };
 
-    // Check if commit is empty by comparing tree to parent tree
     let is_empty_commit = if let Some(parent_id) = commit.parent_ids().first() {
         let parent = store.get_commit(parent_id)?;
         commit.tree_ids() == parent.tree_ids()
@@ -121,61 +97,51 @@ pub async fn inspect(path: &Path) -> Result<RepoState> {
         true
     };
 
-    // Get commit tree
     let commit_tree = commit.tree();
 
-    // Snapshot the working copy
-    let snapshot_options = SnapshotOptions {
-        base_ignores: GitIgnoreFile::empty(),
-        progress: None,
-        start_tracking_matcher: &EverythingMatcher,
-        force_tracking_matcher: &EverythingMatcher,
-        max_new_file_size: u64::MAX,
-    };
-
-    let mut locked_ws = workspace.start_working_copy_mutation()?;
-    let (wc_tree, stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
-
-    // Diff commit tree against working copy tree
-    let mut diff_stream = commit_tree.diff_stream(&wc_tree, &EverythingMatcher);
+    let mut diff_stream = commit_tree.diff_stream(&session.wc_tree, &EverythingMatcher);
 
     let mut modified_files: Vec<PathBuf> = Vec::new();
+    let mut conflicted_files: Vec<PathBuf> = Vec::new();
 
-    while let Some(entry) = diff_stream.next().await {
+    while let Some(entry) = futures::executor::block_on(diff_stream.next()) {
         let fs_path = path.join(entry.path.as_internal_file_string());
-        modified_files.push(fs_path);
+        if let Ok(values) = entry.values {
+            if values.after.iter().any(|v| v.is_none()) {
+                conflicted_files.push(fs_path);
+            } else {
+                modified_files.push(fs_path);
+            }
+        }
     }
 
-    // Collect untracked files
-    let untracked_files: Vec<PathBuf> = stats
+    let untracked_files: Vec<PathBuf> = session
+        .wc_stats
         .untracked_paths
         .keys()
         .map(|p| path.join(p.as_internal_file_string()))
         .collect();
 
-    let has_changes = !modified_files.is_empty();
+    let has_changes = !modified_files.is_empty() || !untracked_files.is_empty();
+    let has_conflicts = !conflicted_files.is_empty();
 
-    // Collect bookmarks
     let bookmarks = collect_bookmarks(repo.as_ref());
-
-    // Determine if remote exists
     let has_remote = bookmarks.iter().any(|b| b.is_tracked);
 
-    // Determine if safe to rewrite
-    // Not safe if any bookmark tracking a remote points to current commit
-    let is_safe_to_rewrite = !bookmarks
-        .iter()
-        .any(|b| b.is_tracked && !b.is_ahead_of_remote && !b.is_behind_remote);
-
-    let root = workspace.workspace_root().to_path_buf();
+    let is_safe_to_rewrite = !bookmarks.iter().any(|b| {
+        b.is_tracked
+            && !b.is_ahead_of_remote
+            && !b.is_behind_remote
+            && b.commit_id.as_deref() == Some(&current_commit_id)
+    });
 
     Ok(RepoState {
-        root,
+        root: session.workspace.workspace_root().to_path_buf(),
         modified_files,
         untracked_files,
-        conflicted_files: Vec::new(),
+        conflicted_files,
         has_changes,
-        has_conflicts: false,
+        has_conflicts,
         current_change_id,
         current_commit_id,
         current_description,
@@ -213,8 +179,11 @@ fn collect_bookmarks(repo: &dyn Repo) -> Vec<BookmarkState> {
                 .iter()
                 .any(|(_remote_name, remote_ref)| remote_ref.target.is_present());
 
+        let commit_id = local_target.as_normal().map(|id| id.hex());
+
         result.push(BookmarkState {
-            name: name.into(),
+            name: name.as_str().to_string(),
+            commit_id,
             is_tracked,
             is_ahead_of_remote,
             is_behind_remote,
@@ -224,74 +193,49 @@ fn collect_bookmarks(repo: &dyn Repo) -> Vec<BookmarkState> {
     result
 }
 
-/// Builds a SemanticSnapshot from the committed tree of the current commit.
-/// This represents the "before" state — what was last committed.
-/// Builds a SemanticSnapshot from the committed tree of the current commit.
-/// This represents the "before" state — what was last committed.
-pub async fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapshot> {
-    // Canonicalize path
-    let path = path.canonicalize()?;
-    let path = path.as_path();
+pub async fn committed_snapshot_from_session(
+    session: &RepoSession,
+) -> Result<crate::semantic::SemanticSnapshot> {
+    let path = session.repo_path.as_path();
+    let store = session.repo.store();
+    let commit = store.get_commit(&session.wc_commit_id)?;
 
-    let ctx = JjContext::new()?;
-    let workspace = ctx.load_workspace(path)?;
-    let repo = workspace.repo_loader().load_at_head().await?;
-    let workspace_name = workspace.workspace_name().to_owned();
-
-    // Get working copy commit
-    let wc_commit_id = repo
-        .view()
-        .get_wc_commit_id(&workspace_name)
-        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?
-        .clone();
-
-    let store = repo.store();
-    let commit = store.get_commit(&wc_commit_id)?;
-
-    // Get PARENT commit tree (the "before" state)
-    // The working copy commit IS the current state
+    // Use PARENT commit tree as the "before" state
     let parent_id = commit
         .parent_ids()
         .first()
         .ok_or_else(|| anyhow::anyhow!("no parent commit"))?;
     let parent_commit = store.get_commit(parent_id)?;
     let committed_tree = parent_commit.tree();
-    // Walk all entries in committed tree
+
     let mut entities = std::collections::HashMap::new();
     let mut files_scanned = 0;
 
     for (repo_path, value_result) in committed_tree.entries() {
-        let merged_value: jj_lib::merge::Merge<Option<jj_lib::backend::TreeValue>> = value_result?;
+        let merged_value = value_result?;
 
-        // Get resolved value, skip conflicts
         let tree_value = match merged_value.as_normal() {
             Some(v) => v,
             None => continue,
         };
 
-        // Only process regular files
         let file_id = match tree_value {
             TreeValue::File { id, .. } => id.clone(),
             _ => continue,
         };
 
-        // Only process Rust files for now
-        let file_name: &str = repo_path.as_internal_file_string();
-        let file_name = file_name.to_string();
+        let file_name = repo_path.as_internal_file_string().to_string();
         if !file_name.ends_with(".rs") {
             continue;
         }
 
-        // Read file content from committed tree using tokio runtime
         let content = {
-            let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> =
-                store.read_file(&repo_path, &file_id).await?;
+            let mut reader = store.read_file(&repo_path, &file_id).await?;
             let mut buf = Vec::new();
             reader.read_to_end(&mut buf).await?;
             buf
         };
 
-        // Convert to string, skip non-utf8 files
         let source = match String::from_utf8(content) {
             Ok(s) => s,
             Err(_) => continue,
@@ -299,7 +243,6 @@ pub async fn committed_snapshot(path: &Path) -> Result<crate::semantic::Semantic
 
         files_scanned += 1;
 
-        // Parse file into entities
         let fs_path = path.join(&file_name);
         let file_entities = crate::semantic::parse_file(&fs_path, &source)?;
 
