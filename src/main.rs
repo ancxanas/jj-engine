@@ -9,7 +9,8 @@ mod work_inference;
 
 use std::path::Path;
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
@@ -171,7 +172,7 @@ fn main() {
             println!("Computing semantic diff for {:?}\n", repo_path);
 
             // Build "before" snapshot from committed tree
-            let before = match repo_inspector::committed_snapshot(repo_path) {
+            let before = match repo_inspector::committed_snapshot(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -355,7 +356,7 @@ fn main() {
             println!("Inferring work units for {}\n", repo_path.display());
 
             // Build before snapshot from committed tree
-            let before = match repo_inspector::committed_snapshot(repo_path) {
+            let before = match repo_inspector::committed_snapshot(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -457,7 +458,7 @@ fn main() {
             println!("Planning actions for {}\n", repo_path.display());
 
             // Read repo state
-            let repo_state = match repo_inspector::inspect(repo_path) {
+            let repo_state = match repo_inspector::inspect(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -472,7 +473,7 @@ fn main() {
             println!("has changes:       {}", repo_state.has_changes);
 
             // Build snapshots and diff
-            let before = match repo_inspector::committed_snapshot(repo_path) {
+            let before = match repo_inspector::committed_snapshot(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -575,7 +576,7 @@ fn main() {
             println!("Applying action plan to {}\n", repo_path.display());
 
             // Read repo state
-            let repo_state = match repo_inspector::inspect(repo_path) {
+            let repo_state = match repo_inspector::inspect(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -584,7 +585,7 @@ fn main() {
             };
 
             // Build snapshots and diff
-            let before = match repo_inspector::committed_snapshot(repo_path) {
+            let before = match repo_inspector::committed_snapshot(repo_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error building committed snapshot: {}", e);
@@ -641,7 +642,7 @@ fn main() {
             );
 
             // Execute
-            match executor::execute(repo_path, &plan, &units, &after) {
+            match executor::execute(repo_path, &plan, &units, &after).await {
                 Ok(report) => {
                     if report.success {
                         for action in &report.actions_executed {
@@ -670,7 +671,7 @@ fn main() {
         _ => {
             let path = Path::new(&args[1]);
             println!("jj-engine: inspecting repo at {:?}", path);
-            match repo_inspector::inspect(path) {
+            match repo_inspector::inspect(path).await {
                 Ok(state) => {
                     println!("\n--- Repo State ---");
                     println!("root:              {:?}", state.root);

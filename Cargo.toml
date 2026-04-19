@@ -6,10 +6,9 @@ edition = "2024"
 [dependencies]
 jj-lib = "0.40.0"
 anyhow = "1"
-pollster = "0.4.0"
 futures = "0.3.32"
 tree-sitter = "0.26.8"
 tree-sitter-rust = "0.24.2"
 walkdir = "2.5.0"
-tokio = { version = "1.51.1", features = ["io-util", "rt"] }
+tokio = { version = "1.51.1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 rustc-hash = "2.1.2"

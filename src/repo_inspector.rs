@@ -12,7 +12,6 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
 use jj_lib::working_copy::SnapshotOptions;
-use pollster::FutureExt as _;
 use tokio::io::AsyncReadExt;
 
 /// The state of a JJ repository at a point in time.
@@ -76,7 +75,7 @@ pub struct BookmarkState {
 }
 
 /// Opens a JJ workspace at the given path and reads repo state.
-pub fn inspect(path: &Path) -> Result<RepoState> {
+pub async fn inspect(path: &Path) -> Result<RepoState> {
     // Canonicalize path so all output uses absolute paths
     let path = path.canonicalize()?;
 
@@ -87,7 +86,7 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let mut workspace = ctx.load_workspace(&path)?;
 
     // Load repo at latest operation
-    let repo = workspace.repo_loader().load_at_head().block_on()?;
+    let repo = workspace.repo_loader().load_at_head().await?;
 
     // Get workspace name
     let workspace_name = workspace.workspace_name().to_owned();
@@ -135,17 +134,14 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     };
 
     let mut locked_ws = workspace.start_working_copy_mutation()?;
-    let (wc_tree, stats) = locked_ws
-        .locked_wc()
-        .snapshot(&snapshot_options)
-        .block_on()?;
+    let (wc_tree, stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
 
     // Diff commit tree against working copy tree
     let mut diff_stream = commit_tree.diff_stream(&wc_tree, &EverythingMatcher);
 
     let mut modified_files: Vec<PathBuf> = Vec::new();
 
-    while let Some(entry) = diff_stream.next().block_on() {
+    while let Some(entry) = diff_stream.next().await {
         let fs_path = path.join(entry.path.as_internal_file_string());
         modified_files.push(fs_path);
     }
@@ -232,14 +228,14 @@ fn collect_bookmarks(repo: &dyn Repo) -> Vec<BookmarkState> {
 /// This represents the "before" state — what was last committed.
 /// Builds a SemanticSnapshot from the committed tree of the current commit.
 /// This represents the "before" state — what was last committed.
-pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapshot> {
+pub async fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapshot> {
     // Canonicalize path
     let path = path.canonicalize()?;
     let path = path.as_path();
 
     let ctx = JjContext::new()?;
     let workspace = ctx.load_workspace(path)?;
-    let repo = workspace.repo_loader().load_at_head().block_on()?;
+    let repo = workspace.repo_loader().load_at_head().await?;
     let workspace_name = workspace.workspace_name().to_owned();
 
     // Get working copy commit
@@ -264,13 +260,8 @@ pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapsh
     let mut entities = std::collections::HashMap::new();
     let mut files_scanned = 0;
 
-    // Create a tokio runtime to run async file reads
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
     for (repo_path, value_result) in committed_tree.entries() {
-        let merged_value = value_result?;
+        let merged_value: jj_lib::merge::Merge<Option<jj_lib::backend::TreeValue>> = value_result?;
 
         // Get resolved value, skip conflicts
         let tree_value = match merged_value.as_normal() {
@@ -285,19 +276,20 @@ pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapsh
         };
 
         // Only process Rust files for now
-        let file_name = repo_path.as_internal_file_string().to_string();
+        let file_name: &str = repo_path.as_internal_file_string();
+        let file_name = file_name.to_string();
         if !file_name.ends_with(".rs") {
             continue;
         }
 
         // Read file content from committed tree using tokio runtime
-        let content = rt.block_on(async {
-            let mut reader = store.read_file(&repo_path, &file_id).await?;
-
+        let content = {
+            let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> =
+                store.read_file(&repo_path, &file_id).await?;
             let mut buf = Vec::new();
             reader.read_to_end(&mut buf).await?;
-            Ok::<Vec<u8>, anyhow::Error>(buf)
-        })?;
+            buf
+        };
 
         // Convert to string, skip non-utf8 files
         let source = match String::from_utf8(content) {
