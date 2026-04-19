@@ -7,19 +7,16 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::jj_context::JjContext;
 use anyhow::Result;
-use jj_lib::config::StackedConfig;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::FilesMatcher;
 use jj_lib::repo::Repo;
-use jj_lib::repo::StoreFactories;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::restore_tree;
-use jj_lib::settings::UserSettings;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
 use pollster::FutureExt as _;
 
 use crate::decision::ActionPlan;
@@ -89,17 +86,8 @@ pub fn execute(
 /// Loads workspace and snapshots working copy.
 /// Returns the workspace (still alive for reuse) and the snapshot tree.
 fn load_and_snapshot(repo_path: &Path) -> Result<(Workspace, jj_lib::merged_tree::MergedTree)> {
-    let config = StackedConfig::with_defaults();
-    let settings = UserSettings::from_config(config)?;
-    let store_factories = StoreFactories::default();
-    let working_copy_factories = default_working_copy_factories();
-
-    let mut workspace = Workspace::load(
-        &settings,
-        repo_path,
-        &store_factories,
-        &working_copy_factories,
-    )?;
+    let ctx = JjContext::new()?;
+    let mut workspace = ctx.load_workspace(repo_path)?;
 
     let snapshot_options = SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
@@ -126,7 +114,8 @@ fn execute_amend(repo_path: &Path, message: &str, warnings: &[String]) -> Result
     let (mut workspace, wc_tree) = load_and_snapshot(repo_path)?;
 
     // Load repo from SAME workspace
-    let repo = workspace.repo_loader().load_at_head().block_on()?;
+    let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
+        workspace.repo_loader().load_at_head().block_on()?;
     let workspace_name = workspace.workspace_name().to_owned();
 
     let wc_commit_id = repo
@@ -175,7 +164,8 @@ fn execute_create(repo_path: &Path, message: &str, warnings: &[String]) -> Resul
     let (mut workspace, wc_tree) = load_and_snapshot(repo_path)?;
 
     // Load repo from SAME workspace
-    let repo = workspace.repo_loader().load_at_head().block_on()?;
+    let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
+        workspace.repo_loader().load_at_head().block_on()?;
     let workspace_name = workspace.workspace_name().to_owned();
 
     let wc_commit_id = repo
@@ -371,7 +361,7 @@ fn execute_split(
                 .collect();
 
             let partial_tree = if repo_paths.is_empty() {
-                wc_tree.clone()
+                wc_tree.clone() as jj_lib::merged_tree::MergedTree
             } else {
                 let matcher = FilesMatcher::new(repo_paths);
                 restore_tree(

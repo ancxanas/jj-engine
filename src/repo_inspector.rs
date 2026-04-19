@@ -3,19 +3,15 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::jj_context::JjContext;
 use anyhow::Result;
 use futures::StreamExt as _;
 use jj_lib::backend::TreeValue;
-use jj_lib::config::StackedConfig;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
-use jj_lib::repo::StoreFactories;
-use jj_lib::settings::UserSettings;
 use jj_lib::working_copy::SnapshotOptions;
-use jj_lib::workspace::Workspace;
-use jj_lib::workspace::default_working_copy_factories;
 use pollster::FutureExt as _;
 use tokio::io::AsyncReadExt;
 
@@ -85,14 +81,10 @@ pub fn inspect(path: &Path) -> Result<RepoState> {
     let path = path.canonicalize()?;
 
     // Build config and settings
-    let config = StackedConfig::with_defaults();
-    let settings = UserSettings::from_config(config)?;
-    let store_factories = StoreFactories::default();
-    let working_copy_factories = default_working_copy_factories();
+    let ctx = JjContext::new()?;
 
     // Open workspace
-    let mut workspace =
-        Workspace::load(&settings, &path, &store_factories, &working_copy_factories)?;
+    let mut workspace = ctx.load_workspace(&path)?;
 
     // Load repo at latest operation
     let repo = workspace.repo_loader().load_at_head().block_on()?;
@@ -245,16 +237,8 @@ pub fn committed_snapshot(path: &Path) -> Result<crate::semantic::SemanticSnapsh
     let path = path.canonicalize()?;
     let path = path.as_path();
 
-    // Build config and settings
-    let config = StackedConfig::with_defaults();
-    let settings = UserSettings::from_config(config)?;
-    let store_factories = StoreFactories::default();
-    let working_copy_factories = default_working_copy_factories();
-
-    // Open workspace
-    let workspace = Workspace::load(&settings, path, &store_factories, &working_copy_factories)?;
-
-    // Load repo at latest operation
+    let ctx = JjContext::new()?;
+    let workspace = ctx.load_workspace(path)?;
     let repo = workspace.repo_loader().load_at_head().block_on()?;
     let workspace_name = workspace.workspace_name().to_owned();
 

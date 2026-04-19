@@ -1,6 +1,7 @@
 mod decision;
 mod executor;
 mod explainer;
+mod jj_context;
 mod policy;
 mod repo_inspector;
 mod semantic;
