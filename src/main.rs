@@ -296,32 +296,22 @@ async fn main() {
             println!("Entities: {}", snapshot.entities.len());
             println!("Edges: {}\n", graph.edge_count());
 
-            println!("Dependencies:\n");
-            for (entity, deps) in &graph.forward {
-                if deps.is_empty() {
-                    continue;
-                }
-                println!(
-                    "  {} ({:?}) in {}",
-                    entity.name,
-                    entity.kind,
-                    entity
-                        .file
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                );
-                for dep in deps {
-                    println!(
-                        "    → {} ({:?}) in {}",
-                        dep.name,
-                        dep.kind,
-                        dep.file
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                    );
-                }
+            println!("Dependency Trees:\n");
+            let mut visited = std::collections::HashSet::new();
+
+            let all_paths: Vec<_> = snapshot.entities.keys().collect();
+            let mut roots: Vec<_> = all_paths
+                .iter()
+                .filter(|p| graph.dependents_of(p).is_empty())
+                .filter(|p| {
+                    p.kind != semantic::EntityKind::Import && p.kind != semantic::EntityKind::Module
+                })
+                .collect();
+
+            roots.sort_by_key(|p| &p.name);
+
+            for root in roots {
+                print_tree(root, &graph, 0, &mut visited);
             }
 
             let all_entities: Vec<semantic::EntityPath> = snapshot
@@ -767,5 +757,31 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+fn print_tree(
+    path: &semantic::EntityPath,
+    graph: &work_inference::DependencyGraph,
+    depth: usize,
+    visited: &mut std::collections::HashSet<semantic::EntityPath>,
+) {
+    let indent = "  ".repeat(depth);
+    let name = format!(
+        "{}::{}",
+        path.file.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+        path.name
+    );
+
+    if visited.contains(path) {
+        println!("{}{}  (seen)", indent, name);
+        return;
+    }
+
+    println!("{}{}", indent, name);
+    visited.insert(path.clone());
+
+    for dep in graph.dependencies_of(path) {
+        print_tree(dep, graph, depth + 1, visited);
     }
 }
