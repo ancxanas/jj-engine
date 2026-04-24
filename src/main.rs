@@ -538,9 +538,6 @@ async fn main() {
                 decision::JjAction::NoOp => {
                     println!("No action needed.");
                 }
-                decision::JjAction::RequireHumanIntervention { reason } => {
-                    println!("⛔ Human intervention required: {}", reason);
-                }
                 decision::JjAction::AmendCommit { message } => {
                     println!("Action: AmendCommit");
                     println!("  Message: \"{}\"", message);
@@ -565,6 +562,15 @@ async fn main() {
                         );
                         println!("    Message: \"{}\"", plan.message);
                     }
+                }
+            }
+
+            if !plan.workspaces.is_empty() {
+                println!("\n--- Workspace Plans ---");
+                for ws in &plan.workspaces {
+                    println!("Create workspace for unit {}:", ws.work_unit_id);
+                    println!("  Name: {}", ws.name);
+                    println!("  Path: {}", ws.path.display());
                 }
             }
 
@@ -653,8 +659,6 @@ async fn main() {
                     decision::JjAction::AmendCommit { .. } => "AmendCommit",
                     decision::JjAction::CreateCommit { .. } => "CreateCommit",
                     decision::JjAction::SplitCommit { .. } => "SplitCommit",
-                    decision::JjAction::RequireHumanIntervention { .. } =>
-                        "RequireHumanIntervention",
                 }
             );
 
@@ -680,6 +684,13 @@ async fn main() {
                 Err(e) => {
                     eprintln!("Execution failed: {}", e);
                     std::process::exit(1);
+                }
+            }
+
+            if !plan.workspaces.is_empty() {
+                println!("\nWorkspaces:");
+                for ws in &plan.workspaces {
+                    println!("  {} → {}", ws.name, ws.path.display());
                 }
             }
         }
