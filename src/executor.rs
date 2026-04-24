@@ -1,8 +1,12 @@
 //! Executor: applies planned actions via jj-lib.
 //!
 //! Takes an ActionPlan and applies it to the JJ repository
-//! using jj-lib primitives. Every action is wrapped in a
-//! single atomic transaction.
+//! using jj-lib primitives.
+//!
+//! Key design rules:
+//! 1. Get wc_tree and parent_tree from the SAME repo.store() after loading repo.
+//! 2. After any mutation (tx.commit, init_workspace), reload workspace/repo fresh.
+//! 3. Never reuse Workspace or MergedTree objects across mutation boundaries.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -41,15 +45,6 @@ impl ExecutionReport {
             error: None,
         }
     }
-
-    fn failure(reason: String) -> Self {
-        Self {
-            success: false,
-            actions_executed: Vec::new(),
-            warnings: Vec::new(),
-            error: Some(reason),
-        }
-    }
 }
 
 /// Executes an action plan against a JJ repository.
@@ -62,35 +57,90 @@ pub async fn execute(
     let repo_path = repo_path.canonicalize()?;
     let repo_path = repo_path.as_path();
 
-    match &plan.action {
-        JjAction::NoOp => Ok(ExecutionReport::success(
-            vec!["No action needed.".to_string()],
-            plan.warnings.clone(),
-        )),
-
-        JjAction::RequireHumanIntervention { reason } => {
-            Ok(ExecutionReport::failure(reason.clone()))
+    let mut report = match &plan.action {
+        JjAction::NoOp => {
+            ExecutionReport::success(vec!["No action needed.".to_string()], plan.warnings.clone())
         }
 
         JjAction::AmendCommit { message } => {
-            execute_amend(repo_path, message, &plan.warnings).await
+            execute_amend(repo_path, message, &plan.warnings).await?
         }
 
         JjAction::CreateCommit { message } => {
-            execute_create(repo_path, message, &plan.warnings).await
+            execute_create(repo_path, message, &plan.warnings).await?
         }
 
         JjAction::SplitCommit { plans } => {
-            execute_split(repo_path, plans, work_units, snapshot, &plan.warnings).await
+            execute_split(repo_path, plans, work_units, snapshot, &plan.warnings).await?
         }
+    };
+
+    // Create workspaces after commits
+    if plan.workspaces.is_empty() {
+        return Ok(report);
     }
+
+    // Phase A: Create all workspace metadata, threading repo forward
+    let ctx = JjContext::new()?;
+    let base_ws = ctx.load_workspace(repo_path)?;
+    let mut latest_repo = base_ws.repo_loader().load_at_head().await?;
+
+    // Store only path + target commit id. Never Workspace objects.
+    let mut created: Vec<(PathBuf, jj_lib::backend::CommitId)> = Vec::new();
+
+    for ws_plan in &plan.workspaces {
+        let base_ws = ctx.load_workspace(repo_path)?;
+
+        // Target commit = current wc commit before workspace metadata changes
+        let target_commit_id = latest_repo
+            .view()
+            .get_wc_commit_id(base_ws.workspace_name())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no working copy commit for target"))?;
+
+        // Create workspace metadata only — no checkout yet
+        let (_new_ws, new_repo) = init_workspace_metadata(&base_ws, &latest_repo, ws_plan).await?;
+
+        created.push((ws_plan.path.clone(), target_commit_id));
+
+        // Thread repo forward to next iteration
+        latest_repo = new_repo;
+    }
+
+    // Phase B: Fresh reload each workspace and checkout using its own repo state
+    for (ws_path, _target_commit_id) in &created {
+        let ctx = JjContext::new()?;
+        let mut ws = ctx.load_workspace(ws_path)?;
+
+        // Fresh repo load from this workspace
+        let repo = ws.repo_loader().load_at_head().await?;
+        let ws_name = ws.workspace_name().to_owned();
+
+        let wc_commit_id = repo
+            .view()
+            .get_wc_commit_id(&ws_name)
+            .ok_or_else(|| anyhow::anyhow!("no working copy commit for workspace"))?
+            .clone();
+
+        // Commit from same store as workspace repo
+        let commit = repo.store().get_commit(&wc_commit_id)?;
+
+        ws.check_out(repo.op_id().clone(), None, &commit).await?;
+
+        report.actions_executed.push(format!(
+            "Workspace '{}' finalized at {}",
+            ws.workspace_name().as_str(),
+            ws.workspace_root().display()
+        ));
+    }
+
+    Ok(report)
 }
 
-/// Loads workspace and snapshots working copy.
-/// Returns the workspace (still alive for reuse) and the snapshot tree.
-async fn load_and_snapshot(
-    repo_path: &Path,
-) -> Result<(Workspace, jj_lib::merged_tree::MergedTree)> {
+/// Snapshots working copy.
+/// Returns workspace (for repo loading) but does NOT return wc_tree.
+/// Get wc_tree from repo.store() after loading repo to guarantee same store.
+async fn load_and_snapshot(repo_path: &Path) -> Result<Workspace> {
     let ctx = JjContext::new()?;
     let mut workspace = ctx.load_workspace(repo_path)?;
 
@@ -103,11 +153,35 @@ async fn load_and_snapshot(
     };
 
     let mut locked_ws = workspace.start_working_copy_mutation()?;
-    let (wc_tree, _stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
+    let (_wc_tree, _stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
     let op_id = locked_ws.locked_wc().old_operation_id().clone();
     locked_ws.finish(op_id).await?;
 
-    Ok((workspace, wc_tree))
+    Ok(workspace)
+}
+
+/// Updates working copy files on disk after a transaction.
+/// Always reloads workspace and repo fresh to avoid stale objects.
+async fn update_working_copy(repo_path: &Path) -> Result<()> {
+    let ctx = JjContext::new()?;
+    let mut workspace = ctx.load_workspace(repo_path)?;
+    let repo = workspace.repo_loader().load_at_head().await?;
+
+    let ws_name = workspace.workspace_name().to_owned();
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(&ws_name)
+        .ok_or_else(|| anyhow::anyhow!("no working copy commit"))?
+        .clone();
+
+    // Commit from same store as repo
+    let commit = repo.store().get_commit(&wc_commit_id)?;
+
+    workspace
+        .check_out(repo.op_id().clone(), None, &commit)
+        .await?;
+
+    Ok(())
 }
 
 /// Amends the current working copy commit.
@@ -116,11 +190,10 @@ async fn execute_amend(
     message: &str,
     warnings: &[String],
 ) -> Result<ExecutionReport> {
-    // Load once
-    let (mut workspace, wc_tree): (Workspace, jj_lib::merged_tree::MergedTree) =
-        load_and_snapshot(repo_path).await?;
+    // Step 1: Snapshot working copy
+    let workspace = load_and_snapshot(repo_path).await?;
 
-    // Load repo from SAME workspace
+    // Step 2: Load repo from SAME workspace after snapshot
     let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
         workspace.repo_loader().load_at_head().await?;
     let workspace_name = workspace.workspace_name().to_owned();
@@ -131,31 +204,30 @@ async fn execute_amend(
         .ok_or_else(|| anyhow::anyhow!("no working copy commit"))?
         .clone();
 
-    let commit = repo.store().get_commit(&wc_commit_id)?;
+    // Step 3: Get wc_tree from repo.store() — same store as everything else
+    let store = repo.store();
+    let wc_commit = store.get_commit(&wc_commit_id)?;
+    let wc_tree = wc_commit.tree();
 
-    // Transaction
+    // Step 4: Transaction
     let mut tx = repo.start_transaction();
 
     let new_commit = tx
         .repo_mut()
-        .rewrite_commit(&commit)
+        .rewrite_commit(&wc_commit)
         .set_description(message)
         .set_tree(wc_tree)
         .write()
         .await?;
 
     tx.repo_mut().rebase_descendants().await?;
-
     tx.repo_mut()
         .set_wc_commit(workspace_name, new_commit.id().clone())?;
 
-    let new_repo = tx.commit("jj-engine: amend commit".to_string()).await?;
+    tx.commit("jj-engine: amend commit".to_string()).await?;
 
-    // Checkout using SAME workspace
-    let final_commit = new_repo.store().get_commit(new_commit.id())?;
-    workspace
-        .check_out(new_repo.op_id().clone(), None, &final_commit)
-        .await?;
+    // Step 5: Fresh reload for checkout — avoids stale object reuse
+    update_working_copy(repo_path).await?;
 
     Ok(ExecutionReport::success(
         vec![format!("Amended commit with message: \"{}\"", message)],
@@ -169,11 +241,10 @@ async fn execute_create(
     message: &str,
     warnings: &[String],
 ) -> Result<ExecutionReport> {
-    // Load once
-    let (mut workspace, wc_tree): (Workspace, jj_lib::merged_tree::MergedTree) =
-        load_and_snapshot(repo_path).await?;
+    // Step 1: Snapshot
+    let workspace = load_and_snapshot(repo_path).await?;
 
-    // Load repo from SAME workspace
+    // Step 2: Load repo from SAME workspace
     let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
         workspace.repo_loader().load_at_head().await?;
     let workspace_name = workspace.workspace_name().to_owned();
@@ -184,7 +255,12 @@ async fn execute_create(
         .ok_or_else(|| anyhow::anyhow!("no working copy commit"))?
         .clone();
 
-    // Transaction
+    // Step 3: Get wc_tree from repo.store()
+    let store = repo.store();
+    let wc_commit = store.get_commit(&wc_commit_id)?;
+    let wc_tree = wc_commit.tree();
+
+    // Step 4: Transaction
     let mut tx = repo.start_transaction();
 
     let new_commit = tx
@@ -198,13 +274,10 @@ async fn execute_create(
     tx.repo_mut()
         .set_wc_commit(workspace_name, new_commit.id().clone())?;
 
-    let new_repo = tx.commit("jj-engine: create commit".to_string()).await?;
+    tx.commit("jj-engine: create commit".to_string()).await?;
 
-    // Checkout using SAME workspace
-    let final_commit = new_repo.store().get_commit(new_commit.id())?;
-    workspace
-        .check_out(new_repo.op_id().clone(), None, &final_commit)
-        .await?;
+    // Step 5: Fresh reload for checkout
+    update_working_copy(repo_path).await?;
 
     Ok(ExecutionReport::success(
         vec![format!("Created commit with message: \"{}\"", message)],
@@ -220,14 +293,12 @@ async fn execute_split(
     snapshot: &crate::semantic::SemanticSnapshot,
     warnings: &[String],
 ) -> Result<ExecutionReport> {
-    // Load once
-    let (mut workspace, wc_tree): (Workspace, jj_lib::merged_tree::MergedTree) =
-        load_and_snapshot(repo_path).await?;
+    // Step 1: Snapshot
+    let workspace = load_and_snapshot(repo_path).await?;
 
-    // Load repo from SAME workspace
+    // Step 2: Load repo from SAME workspace
     let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
         workspace.repo_loader().load_at_head().await?;
-
     let workspace_name = workspace.workspace_name().to_owned();
 
     let wc_commit_id = repo
@@ -236,8 +307,10 @@ async fn execute_split(
         .ok_or_else(|| anyhow::anyhow!("no working copy commit"))?
         .clone();
 
+    // Step 3: Get BOTH trees from SAME store — fixes store mismatch
     let store = repo.store().clone();
     let wc_commit = store.get_commit(&wc_commit_id)?;
+    let wc_tree = wc_commit.tree();
 
     let parent_id = wc_commit
         .parent_ids()
@@ -264,10 +337,6 @@ async fn execute_split(
     let mut sorted_plans = plans.to_vec();
     sorted_plans.sort_by_key(|p| p.order);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
     if all_same_files {
         // Entity-level splitting
         let shared_files: Vec<PathBuf> = plan_file_sets[0].iter().cloned().collect();
@@ -281,7 +350,6 @@ async fn execute_split(
             wc_file_contents.insert(file_path.clone(), lines);
         }
 
-        // Sort by earliest entity line number
         sorted_plans.sort_by_key(|p| {
             lines_for_plan(p, work_units, snapshot)
                 .iter()
@@ -327,10 +395,10 @@ async fn execute_split(
                     .ok_or_else(|| anyhow::anyhow!("invalid path"))?;
                 let repo_path_buf = RepoPathBuf::from_internal_string(rel_str)?;
 
-                let file_id = rt.block_on(async {
+                let file_id = {
                     let mut cursor = std::io::Cursor::new(partial_content.into_bytes());
-                    store.write_file(&repo_path_buf, &mut cursor).await
-                })?;
+                    store.write_file(&repo_path_buf, &mut cursor).await?
+                };
 
                 let value =
                     jj_lib::merge::Merge::resolved(Some(jj_lib::backend::TreeValue::File {
@@ -402,15 +470,11 @@ async fn execute_split(
     tx.repo_mut()
         .set_wc_commit(workspace_name, current_parent_id.clone())?;
 
-    let new_repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> = tx
-        .commit("jj-engine: split work into commits".to_string())
+    tx.commit("jj-engine: split work into commits".to_string())
         .await?;
 
-    // Checkout using SAME workspace
-    let final_commit = new_repo.store().get_commit(&current_parent_id)?;
-    workspace
-        .check_out(new_repo.op_id().clone(), None, &final_commit)
-        .await?;
+    // Step 5: Fresh reload for checkout
+    update_working_copy(repo_path).await?;
 
     Ok(ExecutionReport::success(
         actions_executed,
@@ -453,4 +517,30 @@ fn files_for_plan(plan: &CommitPlan, work_units: &[WorkUnit]) -> Vec<PathBuf> {
     }
 
     files.into_iter().collect()
+}
+
+/// Creates workspace metadata only. No checkout.
+/// Returns the new workspace and the updated repo (for threading).
+async fn init_workspace_metadata(
+    base_workspace: &Workspace,
+    repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
+    workspace_plan: &crate::decision::WorkspacePlan,
+) -> Result<(Workspace, std::sync::Arc<jj_lib::repo::ReadonlyRepo>)> {
+    use jj_lib::ref_name::WorkspaceNameBuf;
+    use jj_lib::workspace::default_working_copy_factory;
+
+    std::fs::create_dir_all(&workspace_plan.path)?;
+
+    let workspace_name = WorkspaceNameBuf::from(workspace_plan.name.as_str());
+
+    let (new_ws, new_repo) = jj_lib::workspace::Workspace::init_workspace_with_existing_repo(
+        &workspace_plan.path,
+        base_workspace.repo_path(),
+        repo,
+        &*default_working_copy_factory(),
+        workspace_name,
+    )
+    .await?;
+
+    Ok((new_ws, new_repo))
 }
