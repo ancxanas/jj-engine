@@ -13,6 +13,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::ReadonlyRepo;
+use jj_lib::repo::Repo;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::SnapshotStats;
 use jj_lib::workspace::Workspace;
@@ -25,8 +26,8 @@ pub struct RepoSession {
     /// Absolute path to the repository root.
     pub repo_path: PathBuf,
 
-    /// The open workspace.
-    pub workspace: Workspace,
+    /// The open workspace (private — use methods for access).
+    workspace: Workspace,
 
     /// The repository at the latest operation head.
     pub repo: Arc<ReadonlyRepo>,
@@ -34,10 +35,7 @@ pub struct RepoSession {
     /// The working copy commit ID.
     pub wc_commit_id: CommitId,
 
-    /// The working copy tree (snapshotted once at session creation).
-    pub wc_tree: MergedTree,
-
-    /// Stats from the snapshot.
+    /// Stats from the snapshot (untracked files etc).
     pub wc_stats: SnapshotStats,
 }
 
@@ -50,7 +48,7 @@ impl RepoSession {
         let ctx = JjContext::new()?;
         let mut workspace = ctx.load_workspace(&repo_path)?;
 
-        // Snapshot working copy
+        // Snapshot working copy to pick up filesystem changes
         let snapshot_options = SnapshotOptions {
             base_ignores: GitIgnoreFile::empty(),
             progress: None,
@@ -60,11 +58,11 @@ impl RepoSession {
         };
 
         let mut locked_ws = workspace.start_working_copy_mutation()?;
-        let (wc_tree, wc_stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
+        let (_wc_tree, wc_stats) = locked_ws.locked_wc().snapshot(&snapshot_options).await?;
         let op_id = locked_ws.locked_wc().old_operation_id().clone();
         locked_ws.finish(op_id).await?;
 
-        // Load repo from same workspace
+        // Load repo from SAME workspace after snapshot
         let repo = workspace.repo_loader().load_at_head().await?;
         let workspace_name = workspace.workspace_name().to_owned();
 
@@ -79,8 +77,19 @@ impl RepoSession {
             workspace,
             repo,
             wc_commit_id,
-            wc_tree,
             wc_stats,
         })
+    }
+
+    /// Returns the working copy tree from repo store.
+    /// Always consistent with repo store — no store mismatch risk.
+    pub fn wc_tree(&self) -> Result<MergedTree> {
+        let commit = self.repo.store().get_commit(&self.wc_commit_id)?;
+        Ok(commit.tree())
+    }
+
+    /// Returns the workspace root path.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.workspace_root()
     }
 }

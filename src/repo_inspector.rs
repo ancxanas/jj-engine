@@ -74,7 +74,7 @@ pub struct BookmarkState {
     pub is_behind_remote: bool,
 }
 
-pub fn inspect_from_session(session: &RepoSession) -> Result<RepoState> {
+pub async fn inspect_from_session(session: &RepoSession) -> Result<RepoState> {
     let path = session.repo_path.as_path();
     let repo = &session.repo;
     let store = repo.store();
@@ -99,12 +99,13 @@ pub fn inspect_from_session(session: &RepoSession) -> Result<RepoState> {
 
     let commit_tree = commit.tree();
 
-    let mut diff_stream = commit_tree.diff_stream(&session.wc_tree, &EverythingMatcher);
+    let wc_tree = session.wc_tree()?;
+    let mut diff_stream = commit_tree.diff_stream(&wc_tree, &EverythingMatcher);
 
     let mut modified_files: Vec<PathBuf> = Vec::new();
     let mut conflicted_files: Vec<PathBuf> = Vec::new();
 
-    while let Some(entry) = futures::executor::block_on(diff_stream.next()) {
+    while let Some(entry) = diff_stream.next().await {
         let fs_path = path.join(entry.path.as_internal_file_string());
         if let Ok(values) = entry.values {
             if values.after.iter().any(|v| v.is_none()) {
@@ -136,7 +137,7 @@ pub fn inspect_from_session(session: &RepoSession) -> Result<RepoState> {
     });
 
     Ok(RepoState {
-        root: session.workspace.workspace_root().to_path_buf(),
+        root: session.workspace_root().to_path_buf(),
         modified_files,
         untracked_files,
         conflicted_files,

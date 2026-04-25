@@ -13,11 +13,11 @@ use jj_lib::workspace::Workspace;
 use jj_lib::workspace::default_working_copy_factories;
 
 /// Shared context for opening JJ workspaces.
-/// Build once and reuse across functions.
+/// Build once and reuse across functions that need workspace access.
 pub struct JjContext {
-    pub settings: UserSettings,
-    pub store_factories: StoreFactories,
-    pub working_copy_factories: WorkingCopyFactories,
+    settings: UserSettings,
+    store_factories: StoreFactories,
+    working_copy_factories: WorkingCopyFactories,
 }
 
 impl JjContext {
