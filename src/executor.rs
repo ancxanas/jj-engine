@@ -57,6 +57,8 @@ pub async fn execute(
     let repo_path = repo_path.canonicalize()?;
     let repo_path = repo_path.as_path();
 
+    let mut work_unit_commit_map: std::collections::HashMap<usize, jj_lib::backend::CommitId> =
+        std::collections::HashMap::new();
     let mut report = match &plan.action {
         JjAction::NoOp => {
             ExecutionReport::success(vec!["No action needed.".to_string()], plan.warnings.clone())
@@ -71,7 +73,10 @@ pub async fn execute(
         }
 
         JjAction::SplitCommit { plans } => {
-            execute_split(repo_path, plans, work_units, snapshot, &plan.warnings).await?
+            let (split_report, commit_map) =
+                execute_split(repo_path, plans, work_units, snapshot, &plan.warnings).await?;
+            work_unit_commit_map = commit_map;
+            split_report
         }
     };
 
@@ -92,11 +97,12 @@ pub async fn execute(
         let base_ws = ctx.load_workspace(repo_path)?;
 
         // Target commit = current wc commit before workspace metadata changes
-        let target_commit_id = latest_repo
-            .view()
-            .get_wc_commit_id(base_ws.workspace_name())
+        let target_commit_id = work_unit_commit_map
+            .get(&ws_plan.work_unit_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no working copy commit for target"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no commit found for work unit {}", ws_plan.work_unit_id)
+            })?;
 
         // Create workspace metadata only — no checkout yet
         let (_new_ws, new_repo) = init_workspace_metadata(&base_ws, &latest_repo, ws_plan).await?;
@@ -107,31 +113,58 @@ pub async fn execute(
         latest_repo = new_repo;
     }
 
-    // Phase B: Fresh reload each workspace and checkout using its own repo state
-    for (ws_path, _target_commit_id) in &created {
+    // Phase B: Use a transaction to properly checkout each workspace
+    // MutableRepo::check_out() updates both repo view AND working copy files
+    {
         let ctx = JjContext::new()?;
-        let mut ws = ctx.load_workspace(ws_path)?;
+        let base_ws = ctx.load_workspace(repo_path)?;
+        let repo = base_ws.repo_loader().load_at_head().await?;
 
-        // Fresh repo load from this workspace
-        let repo = ws.repo_loader().load_at_head().await?;
-        let ws_name = ws.workspace_name().to_owned();
+        let mut tx = repo.start_transaction();
 
-        let wc_commit_id = repo
-            .view()
-            .get_wc_commit_id(&ws_name)
-            .ok_or_else(|| anyhow::anyhow!("no working copy commit for workspace"))?
-            .clone();
+        // First update repo view for all new workspaces
+        for (ws_path, target_commit_id) in &created {
+            let ctx = JjContext::new()?;
+            let ws = ctx.load_workspace(ws_path)?;
+            let ws_name = ws.workspace_name().to_owned();
 
-        // Commit from same store as workspace repo
-        let commit = repo.store().get_commit(&wc_commit_id)?;
+            let target_commit = tx.repo_mut().store().get_commit(target_commit_id)?;
 
-        ws.check_out(repo.op_id().clone(), None, &commit).await?;
+            // Creates new wc commit on top of target and updates repo view
+            tx.repo_mut().check_out(ws_name, &target_commit).await?;
+        }
 
-        report.actions_executed.push(format!(
-            "Workspace '{}' finalized at {}",
-            ws.workspace_name().as_str(),
-            ws.workspace_root().display()
-        ));
+        tx.repo_mut().rebase_descendants().await?;
+
+        tx.commit("jj-engine: finalize workspaces".to_string())
+            .await?;
+
+        // Now update each created workspace's files on disk using a repo loaded
+        // FROM THAT SAME WORKSPACE. This guarantees same Store Arc.
+        for (ws_path, _) in &created {
+            let ctx = JjContext::new()?;
+            let mut ws = ctx.load_workspace(ws_path)?;
+            let repo = ws.repo_loader().load_at_head().await?;
+            let ws_name = ws.workspace_name().to_owned();
+
+            let wc_commit_id = repo
+                .view()
+                .get_wc_commit_id(&ws_name)
+                .ok_or_else(|| anyhow::anyhow!("no wc commit for workspace"))?
+                .clone();
+
+            let wc_commit = repo.store().get_commit(&wc_commit_id)?;
+            ws.check_out(repo.op_id().clone(), None, &wc_commit).await?;
+
+            report.actions_executed.push(format!(
+                "Workspace '{}' finalized at {}",
+                ws.workspace_name().as_str(),
+                ws.workspace_root().display()
+            ));
+        }
+
+        // Finally refresh the default workspace too
+        update_working_copy(repo_path).await?;
     }
 
     Ok(report)
@@ -292,10 +325,14 @@ async fn execute_split(
     work_units: &[WorkUnit],
     snapshot: &crate::semantic::SemanticSnapshot,
     warnings: &[String],
-) -> Result<ExecutionReport> {
+) -> Result<(
+    ExecutionReport,
+    std::collections::HashMap<usize, jj_lib::backend::CommitId>,
+)> {
     // Step 1: Snapshot
     let workspace = load_and_snapshot(repo_path).await?;
-
+    let mut work_unit_to_commit: std::collections::HashMap<usize, jj_lib::backend::CommitId> =
+        std::collections::HashMap::new();
     // Step 2: Load repo from SAME workspace
     let repo: std::sync::Arc<jj_lib::repo::ReadonlyRepo> =
         workspace.repo_loader().load_at_head().await?;
@@ -423,6 +460,9 @@ async fn execute_split(
             actions_executed.push(format!("Created commit: \"{}\"", plan.message));
 
             current_parent_id = new_commit.id().clone();
+            for unit_id in &plan.work_unit_ids {
+                work_unit_to_commit.insert(*unit_id, new_commit.id().clone());
+            }
             committed_up_to = include_up_to;
         }
     } else {
@@ -476,9 +516,9 @@ async fn execute_split(
     // Step 5: Fresh reload for checkout
     update_working_copy(repo_path).await?;
 
-    Ok(ExecutionReport::success(
-        actions_executed,
-        warnings.to_vec(),
+    Ok((
+        ExecutionReport::success(actions_executed, warnings.to_vec()),
+        work_unit_to_commit,
     ))
 }
 
