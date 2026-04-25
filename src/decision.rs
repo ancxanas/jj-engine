@@ -26,6 +26,15 @@ pub struct WorkspacePlan {
     pub path: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct BookmarkPlan {
+    /// The work unit this bookmark is for.
+    pub work_unit_id: usize,
+
+    /// Name of the bookmark.
+    pub name: String,
+}
+
 /// A specific JJ action the engine wants to perform.
 #[derive(Debug, Clone)]
 pub enum JjAction {
@@ -64,6 +73,9 @@ pub struct ActionPlan {
     /// Additional workspace actions to perform after commits
     pub workspaces: Vec<WorkspacePlan>,
 
+    /// Additional bookmark actions to perform after commits.
+    pub bookmarks: Vec<BookmarkPlan>,
+
     /// Non-blocking warnings.
     pub warnings: Vec<String>,
 }
@@ -80,6 +92,7 @@ pub fn decide(repo_state: &RepoState, work_units: &[WorkUnit]) -> ActionPlan {
         return ActionPlan {
             action: JjAction::NoOp,
             workspaces: Vec::new(),
+            bookmarks: Vec::new(),
             warnings: vec!["conflicts detected — waiting for resolution".to_string()],
         };
     }
@@ -89,13 +102,16 @@ pub fn decide(repo_state: &RepoState, work_units: &[WorkUnit]) -> ActionPlan {
         return ActionPlan {
             action: JjAction::NoOp,
             workspaces: Vec::new(),
+            bookmarks: Vec::new(),
             warnings,
         };
     }
 
     // Generate warnings
     warnings = crate::explainer::generate_warnings(work_units);
+
     let workspace_plans = plan_workspaces(repo_state, work_units);
+    let bookmark_plans = plan_bookmarks(work_units);
 
     // Step 3: Determine if we can amend or must create
     let can_amend = repo_state.is_safe_to_rewrite;
@@ -113,6 +129,7 @@ pub fn decide(repo_state: &RepoState, work_units: &[WorkUnit]) -> ActionPlan {
         return ActionPlan {
             action,
             workspaces: workspace_plans,
+            bookmarks: bookmark_plans,
             warnings,
         };
     }
@@ -145,6 +162,7 @@ pub fn decide(repo_state: &RepoState, work_units: &[WorkUnit]) -> ActionPlan {
     ActionPlan {
         action,
         workspaces: workspace_plans,
+        bookmarks: bookmark_plans,
         warnings,
     }
 }
@@ -396,4 +414,43 @@ fn plan_workspaces(repo_state: &RepoState, work_units: &[WorkUnit]) -> Vec<Works
     }
 
     workspace_plans
+}
+
+fn plan_bookmarks(work_units: &[WorkUnit]) -> Vec<BookmarkPlan> {
+    let mut plans = Vec::new();
+
+    for unit in work_units {
+        if unit.kind == WorkKind::Feature {
+            // Pick first meaningful name for bookmark
+            let first_entity_name = unit
+                .entities
+                .first()
+                .map(|e| e.name.as_str())
+                .unwrap_or("feature");
+
+            let sanitized = first_entity_name
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>();
+
+            let name = format!("feature-{}", sanitized);
+
+            plans.push(BookmarkPlan {
+                work_unit_id: unit.id,
+                name,
+            });
+        }
+    }
+
+    // Handle name collisions if multiple features result in same bookmark name
+    let mut name_counts = std::collections::HashMap::new();
+    for plan in &mut plans {
+        let count = name_counts.entry(plan.name.clone()).or_insert(0);
+        if *count > 0 {
+            plan.name = format!("{}-{}", plan.name, count);
+        }
+        *count += 1;
+    }
+
+    plans
 }
