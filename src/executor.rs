@@ -16,6 +16,8 @@ use anyhow::Result;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::FilesMatcher;
+use jj_lib::op_store::RefTarget;
+use jj_lib::ref_name::RefNameBuf;
 use jj_lib::repo::Repo;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::restore_tree;
@@ -65,11 +67,17 @@ pub async fn execute(
         }
 
         JjAction::AmendCommit { message } => {
-            execute_amend(repo_path, message, &plan.warnings).await?
+            let (report, commit_map) =
+                execute_amend(repo_path, message, &plan.warnings, work_units).await?;
+            work_unit_commit_map = commit_map;
+            report
         }
 
         JjAction::CreateCommit { message } => {
-            execute_create(repo_path, message, &plan.warnings).await?
+            let (report, commit_map) =
+                execute_create(repo_path, message, &plan.warnings, work_units).await?;
+            work_unit_commit_map = commit_map;
+            report
         }
 
         JjAction::SplitCommit { plans } => {
@@ -165,6 +173,14 @@ pub async fn execute(
 
         // Finally refresh the default workspace too
         update_working_copy(repo_path).await?;
+        // Create bookmarks after workspaces
+    }
+
+    if !plan.bookmarks.is_empty() {
+        let bookmark_msgs =
+            execute_create_bookmarks(repo_path, &plan.bookmarks, &work_unit_commit_map).await?;
+
+        report.actions_executed.extend(bookmark_msgs);
     }
 
     Ok(report)
@@ -222,7 +238,11 @@ async fn execute_amend(
     repo_path: &Path,
     message: &str,
     warnings: &[String],
-) -> Result<ExecutionReport> {
+    work_units: &[WorkUnit],
+) -> Result<(
+    ExecutionReport,
+    std::collections::HashMap<usize, jj_lib::backend::CommitId>,
+)> {
     // Step 1: Snapshot working copy
     let workspace = load_and_snapshot(repo_path).await?;
 
@@ -262,9 +282,17 @@ async fn execute_amend(
     // Step 5: Fresh reload for checkout — avoids stale object reuse
     update_working_copy(repo_path).await?;
 
-    Ok(ExecutionReport::success(
-        vec![format!("Amended commit with message: \"{}\"", message)],
-        warnings.to_vec(),
+    let mut work_unit_to_commit = std::collections::HashMap::new();
+    for unit in work_units {
+        work_unit_to_commit.insert(unit.id, new_commit.id().clone());
+    }
+
+    Ok((
+        ExecutionReport::success(
+            vec![format!("Amended commit with message: \"{}\"", message)],
+            warnings.to_vec(),
+        ),
+        work_unit_to_commit,
     ))
 }
 
@@ -273,7 +301,11 @@ async fn execute_create(
     repo_path: &Path,
     message: &str,
     warnings: &[String],
-) -> Result<ExecutionReport> {
+    work_units: &[WorkUnit],
+) -> Result<(
+    ExecutionReport,
+    std::collections::HashMap<usize, jj_lib::backend::CommitId>,
+)> {
     // Step 1: Snapshot
     let workspace = load_and_snapshot(repo_path).await?;
 
@@ -312,9 +344,17 @@ async fn execute_create(
     // Step 5: Fresh reload for checkout
     update_working_copy(repo_path).await?;
 
-    Ok(ExecutionReport::success(
-        vec![format!("Created commit with message: \"{}\"", message)],
-        warnings.to_vec(),
+    let mut work_unit_to_commit = std::collections::HashMap::new();
+    for unit in work_units {
+        work_unit_to_commit.insert(unit.id, new_commit.id().clone());
+    }
+
+    Ok((
+        ExecutionReport::success(
+            vec![format!("Created commit with message: \"{}\"", message)],
+            warnings.to_vec(),
+        ),
+        work_unit_to_commit,
     ))
 }
 
@@ -583,4 +623,43 @@ async fn init_workspace_metadata(
     .await?;
 
     Ok((new_ws, new_repo))
+}
+
+async fn execute_create_bookmarks(
+    repo_path: &Path,
+    bookmark_plans: &[crate::decision::BookmarkPlan],
+    work_unit_commit_map: &std::collections::HashMap<usize, jj_lib::backend::CommitId>,
+) -> Result<Vec<String>> {
+    let ctx = JjContext::new()?;
+    let workspace = ctx.load_workspace(repo_path)?;
+    let repo = workspace.repo_loader().load_at_head().await?;
+
+    let mut tx = repo.start_transaction();
+    let mut messages = Vec::new();
+
+    for bm in bookmark_plans {
+        let commit_id = work_unit_commit_map
+            .get(&bm.work_unit_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no commit id found for bookmark work unit {}",
+                    bm.work_unit_id
+                )
+            })?
+            .clone();
+
+        let name_buf = RefNameBuf::from(bm.name.as_str());
+
+        tx.repo_mut()
+            .set_local_bookmark_target(name_buf.as_ref(), RefTarget::resolved(Some(commit_id)));
+
+        messages.push(format!("Bookmark '{}' created", bm.name));
+    }
+
+    tx.commit("jj-engine: create bookmarks".to_string()).await?;
+
+    // Refresh default workspace after bookmark transaction
+    update_working_copy(repo_path).await?;
+
+    Ok(messages)
 }
