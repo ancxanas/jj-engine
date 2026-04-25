@@ -470,7 +470,7 @@ async fn main() {
                 }
             };
 
-            let repo_state = match repo_inspector::inspect_from_session(&session) {
+            let repo_state = match repo_inspector::inspect_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -574,6 +574,14 @@ async fn main() {
                 }
             }
 
+            if !plan.bookmarks.is_empty() {
+                println!("\n--- Bookmark Plans ---");
+                for bm in &plan.bookmarks {
+                    println!("Create bookmark for unit {}:", bm.work_unit_id);
+                    println!("  Name: {}", bm.name);
+                }
+            }
+
             if !plan.warnings.is_empty() {
                 println!("\n--- Warnings ---");
                 for warning in &plan.warnings {
@@ -600,7 +608,7 @@ async fn main() {
                 }
             };
 
-            let repo_state = match repo_inspector::inspect_from_session(&session) {
+            let repo_state = match repo_inspector::inspect_from_session(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error reading repo state: {}", e);
@@ -693,6 +701,13 @@ async fn main() {
                     println!("  {} → {}", ws.name, ws.path.display());
                 }
             }
+
+            if !plan.bookmarks.is_empty() {
+                println!("\nBookmarks:");
+                for bm in &plan.bookmarks {
+                    println!("  {} → unit {}", bm.name, bm.work_unit_id);
+                }
+            }
         }
 
         // Default: repo inspection mode
@@ -708,7 +723,7 @@ async fn main() {
                 }
             };
 
-            match repo_inspector::inspect_from_session(&session) {
+            match repo_inspector::inspect_from_session(&session).await {
                 Ok(state) => {
                     println!("\n--- Repo State ---");
                     println!("root:              {:?}", state.root);
