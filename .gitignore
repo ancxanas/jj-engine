@@ -1,7 +1,12 @@
 /target
- Cargo.lock
 **/*.rs.bk
 *.pdb
 .env
 .env.local
 .DS_Store
+
+.cargo/
+.opencode/
+openspec/
+.autonomous-vcs/*.log
+.autonomous-vcs/daemon.pid
