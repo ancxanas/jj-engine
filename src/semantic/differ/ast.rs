@@ -76,6 +76,7 @@ fn addition_kind(kind: &str) -> StructuralChangeKind {
         "import_statement" => StructuralChangeKind::ImportAdded,
         "export_statement" => StructuralChangeKind::ExportAdded,
         "call_expression" => StructuralChangeKind::TestCaseAdded,
+        "try_statement" => StructuralChangeKind::TryCatchAdded,
         _ => StructuralChangeKind::FunctionAdded,
     }
 }
