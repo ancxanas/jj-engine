@@ -22,6 +22,14 @@ max_subject_length = 72
 [output]
 default_format = "human"
 color = true
+
+[daemon]
+enabled = true
+debounce_ms = 2000
+watch_patterns = ["src/**/*", "*.toml", "*.md"]
+exclude_patterns = ["target/**", "node_modules/**"]
+log_level = "info"
+auto_commit = true
 "#;
 
 pub fn run() -> anyhow::Result<()> {

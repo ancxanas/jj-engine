@@ -1,9 +1,11 @@
 use owo_colors::OwoColorize;
 
 use crate::core::output::renderer::Renderer;
-use crate::core::types::{AnalysisResult, FileChange, FileChangeType, Intent, PolicyDecision};
+use crate::core::types::{AnalysisResult, FileChange, FileChangeType, ImpactLevel, Intent, PolicyDecision};
 
-pub struct HumanRenderer;
+pub struct HumanRenderer {
+    pub verbose: bool,
+}
 
 impl Renderer for HumanRenderer {
     #[allow(clippy::format_push_string)]
@@ -11,16 +13,33 @@ impl Renderer for HumanRenderer {
         let mut output = String::new();
 
         output.push_str(&format!(
-            "\n{}\n  {} files | {}ms\n  jj:{} {}\n",
+            "\n{}\n  {} files | {}ms\n  commit:{} {}\n",
             "AVCS Analysis".bold(),
             result.meta.total_files_changed,
             result.meta.analysis_duration_ms,
-            result.meta.jj_change_id,
+            result.meta.commit_sha,
             result.meta.timestamp.format("%Y-%m-%d %H:%M:%S"),
         ));
 
         for (index, intent) in result.intents.iter().enumerate() {
             output.push_str(&render_intent(index + 1, intent));
+        }
+
+        for ambiguous in &result.ambiguous {
+            output.push_str(&format!(
+                "\n  {} | {} file(s)\n",
+                "Ambiguous".yellow().bold(),
+                ambiguous.files.len(),
+            ));
+            for (pattern, _) in &ambiguous.candidates {
+                output.push_str(&format!("    Candidate: {pattern:?}\n"));
+            }
+            for file in &ambiguous.files {
+                output.push_str(&format!("    {}\n", file.display()));
+            }
+            if self.verbose {
+                output.push_str("    Reason: multiple rules matched with equal confidence\n");
+            }
         }
 
         for unclassified in &result.unclassified {
@@ -33,15 +52,19 @@ impl Renderer for HumanRenderer {
             for file in &unclassified.files {
                 output.push_str(&format!("    {}\n", file.display()));
             }
+            if self.verbose {
+                output.push_str("    Hint: check if file has detectable structural changes\n");
+            }
         }
 
         output.push_str(&format!(
-            "\n  {}\n    {} intents found\n    {} auto-committable\n    {} requires review\n    {} blocked\n    {} unclassified\n",
+            "\n  {}\n    {} intents found\n    {} auto-committable\n    {} requires review\n    {} blocked\n    {} ambiguous\n    {} unclassified\n",
             "SUMMARY".bold(),
             result.stats.total_intents,
             result.stats.auto_committable,
             result.stats.requires_review,
             result.stats.blocked,
+            result.stats.ambiguous,
             result.stats.unclassified,
         ));
 
@@ -63,12 +86,20 @@ fn render_intent(index: usize, intent: &Intent) -> String {
         PolicyDecision::Blocked { .. } => "BLOCKED".red().to_string(),
     };
 
+    let impact_label = match intent.impact.level {
+        ImpactLevel::Low => "Low".dimmed().to_string(),
+        ImpactLevel::Medium => "Medium".yellow().to_string(),
+        ImpactLevel::High => "High".red().to_string(),
+        ImpactLevel::Critical => "Critical".red().bold().to_string(),
+    };
+
     let mut output = format!(
-        "\n{}\n\n  {} | {:?} | {}\n  {}\n",
+        "\n{}\n\n  {} | {:?} | {} | Impact: {}\n  {}\n",
         "-".repeat(50),
         format!("Intent {index}").bold(),
         intent.pattern,
         policy_label,
+        impact_label,
         intent.suggested_message,
     );
 

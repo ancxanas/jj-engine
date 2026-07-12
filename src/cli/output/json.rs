@@ -22,8 +22,7 @@ mod tests {
             meta: AnalysisMeta {
                 timestamp: Utc::now(),
                 project_root: "/tmp/test".into(),
-                jj_change_id: String::from("abc"),
-                jj_commit_id: String::from("def"),
+                commit_sha: String::from("abc123"),
                 total_files_changed: 0,
                 analysis_duration_ms: 0,
                 analyzer_version: String::from("0.1.0"),

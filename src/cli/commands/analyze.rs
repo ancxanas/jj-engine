@@ -1,18 +1,19 @@
-use jj_lib::object_id::ObjectId;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::core::config::Config;
 use crate::core::output::renderer::Renderer;
 use crate::core::types::{
-    AnalysisMeta, AnalysisResult, AnalysisStats, ChangePattern, Evidence, FileChange,
-    FileChangeType, ImpactAssessment, ImpactLevel, Intent, IntentStatus, PolicyDecision,
-    StructuralChange, UnclassifiedChange,
+    AnalysisMeta, AnalysisResult, AmbiguousChange, AnalysisStats, ChangePattern, Evidence, FileChange,
+    FileChangeType, Intent, IntentStatus, Location, PolicyDecision, StructuralChange,
+    StructuralChangeKind, UnclassifiedChange,
 };
 use crate::intent::classifier::engine::{self, ClassificationResult};
 use crate::intent::cluster::{edges, graph::RelationshipGraph, partition};
 use crate::intent::message::generator;
 use crate::intent::policy;
-use crate::jj::diff::{self, FileDiff};
+use crate::intent::policy::rules::infer_impact;
+use crate::vcs::diff::{self, FileDiff};
 use crate::semantic::languages;
 
 struct AnalyzedFile {
@@ -24,11 +25,26 @@ struct AnalyzedFile {
 }
 
 pub fn run(json: bool) -> anyhow::Result<()> {
+    let result = analyze()?;
+
+    let output = if json {
+        crate::cli::output::json::JsonRenderer.render(&result)
+    } else {
+        crate::cli::output::human::HumanRenderer { verbose: false }.render(&result)
+    };
+    println!("{output}");
+    Ok(())
+}
+
+pub fn analyze() -> anyhow::Result<AnalysisResult> {
     let start = Instant::now();
     let project_root = std::env::current_dir()?;
-    let handle = crate::jj::repo::open(&project_root)?;
-    let diffs = diff::get_working_copy_diff(&handle)?;
-    let (jj_change_id, jj_commit_id) = current_ids(&handle)?;
+    let config = Config::load(&project_root)?;
+    let git_repo = crate::vcs::repo::GitRepo::open(&project_root)?;
+    let all_diffs = diff::get_working_copy_diff(&git_repo)?;
+    let commit_sha = git_repo.head_sha()?;
+
+    let diffs = all_diffs;
 
     let mut graph = RelationshipGraph::new();
     let mut analyzed_files = Vec::new();
@@ -38,7 +54,8 @@ pub fn run(json: bool) -> anyhow::Result<()> {
         let classification = engine::classify(&path, &changes, &evidence);
         let pattern = match &classification {
             ClassificationResult::Classified { pattern, .. } => pattern.clone(),
-            ClassificationResult::Unclassified { .. } => ChangePattern::Unknown,
+            ClassificationResult::Ambiguous { .. }
+            | ClassificationResult::Unclassified { .. } => ChangePattern::Unknown,
         };
 
         graph.add_file(path.clone(), pattern);
@@ -59,54 +76,55 @@ pub fn run(json: bool) -> anyhow::Result<()> {
     for (index, group) in groups.iter().enumerate() {
         let (evidence, rule) = merge_evidence(&group.files, &evidence_data);
         let message = generator::generate(group, &evidence, rule);
-        let policy_decision = policy::engine::evaluate(&group.pattern);
+        let auto_patterns: Vec<ChangePattern> = config
+            .autonomy
+            .auto_commit_patterns
+            .iter()
+            .filter_map(|s| ChangePattern::parse(s))
+            .collect();
+        let policy_decision = policy::engine::evaluate_with_config(&group.pattern, &auto_patterns);
+        let intent_files = build_intent_files(group, &analyzed_files);
+        let all_changes: Vec<_> = intent_files
+            .iter()
+            .flat_map(|f| &f.structural_changes)
+            .cloned()
+            .collect();
+        let impact = infer_impact(&all_changes, group.files.len());
 
         intents.push(Intent {
             id: format!("int-{:03}", index + 1),
             pattern: group.pattern.clone(),
             suggested_message: message,
-            files: build_intent_files(group, &analyzed_files),
+            files: intent_files,
             evidence,
             clustering_reason: group.reason.clone(),
             relationships: group.relationships.clone(),
-            impact: ImpactAssessment {
-                level: ImpactLevel::Low,
-                affected_files: group.files.len(),
-                is_public_api_change: false,
-                is_breaking: false,
-                notes: vec![],
-            },
+            impact,
             order: index + 1,
             status: IntentStatus::Pending,
             policy: policy_decision,
         });
     }
 
+    let ambiguous = build_ambiguous(&analyzed_files);
     let unclassified = build_unclassified(&analyzed_files);
-    let stats = build_stats(&intents, &unclassified, start.elapsed());
+    let stats = build_stats(&intents, &ambiguous, &unclassified, start.elapsed());
     let result = AnalysisResult {
         meta: AnalysisMeta {
             timestamp: chrono::Utc::now(),
             project_root,
-            jj_change_id,
-            jj_commit_id,
+            commit_sha,
             total_files_changed: diffs.len(),
             analysis_duration_ms: duration_ms(start.elapsed()),
             analyzer_version: env!("CARGO_PKG_VERSION").into(),
         },
         intents,
-        ambiguous: vec![],
+        ambiguous,
         unclassified,
         stats,
     };
 
-    let output = if json {
-        crate::cli::output::json::JsonRenderer.render(&result)
-    } else {
-        crate::cli::output::human::HumanRenderer.render(&result)
-    };
-    println!("{output}");
-    Ok(())
+    Ok(result)
 }
 
 pub fn analyze_file(
@@ -115,7 +133,8 @@ pub fn analyze_file(
     match diff {
         FileDiff::Added { path, content, .. } => {
             let Some(analyzer) = languages::analyzer_for(path) else {
-                return Ok((path.clone(), vec![], vec![]));
+                let synthetic = synthetic_change(path, StructuralChangeKind::FileAdded);
+                return Ok((path.clone(), vec![synthetic], vec![]));
             };
             if analyzer.language_id() == "docs" {
                 return Ok((path.clone(), vec![], analyzer.detect_evidence(&[])));
@@ -129,7 +148,8 @@ pub fn analyze_file(
         }
         FileDiff::Removed { path, content, .. } => {
             let Some(analyzer) = languages::analyzer_for(path) else {
-                return Ok((path.clone(), vec![], vec![]));
+                let synthetic = synthetic_change(path, StructuralChangeKind::FileRemoved);
+                return Ok((path.clone(), vec![synthetic], vec![]));
             };
             if analyzer.language_id() == "docs" {
                 return Ok((path.clone(), vec![], analyzer.detect_evidence(&[])));
@@ -148,7 +168,8 @@ pub fn analyze_file(
             ..
         } => {
             let Some(analyzer) = languages::analyzer_for(path) else {
-                return Ok((path.clone(), vec![], vec![]));
+                let synthetic = synthetic_change(path, StructuralChangeKind::FileModified);
+                return Ok((path.clone(), vec![synthetic], vec![]));
             };
             if analyzer.language_id() == "docs" {
                 return Ok((path.clone(), vec![], analyzer.detect_evidence(&[])));
@@ -159,6 +180,18 @@ pub fn analyze_file(
             let evidence = analyzer.detect_evidence(&changes);
             Ok((path.clone(), changes, evidence))
         }
+    }
+}
+
+fn synthetic_change(path: &std::path::Path, kind: StructuralChangeKind) -> StructuralChange {
+    let name = path
+        .file_name()
+        .map_or_else(|| path.to_string_lossy().to_string(), |n| n.to_string_lossy().to_string());
+    StructuralChange {
+        kind,
+        name,
+        detail: "unsupported language".into(),
+        location: Location { file: path.to_path_buf(), line: 0, column: 0 },
     }
 }
 
@@ -181,19 +214,6 @@ pub fn merge_evidence(
         }
     }
     (evidence, rule)
-}
-
-fn current_ids(repo_handle: &crate::jj::repo::RepoHandle) -> anyhow::Result<(String, String)> {
-    use jj_lib::repo::Repo;
-
-    let repo = &repo_handle.repo;
-    let wc_commit_id = repo
-        .view()
-        .get_wc_commit_id(&repo_handle.workspace_name)
-        .ok_or_else(|| anyhow::anyhow!("no working copy commit found"))?
-        .clone();
-    let wc_commit = repo.store().get_commit(&wc_commit_id)?;
-    Ok((wc_commit.change_id().hex(), wc_commit.id().hex()))
 }
 
 #[must_use]
@@ -240,6 +260,32 @@ fn build_intent_files(
 }
 
 #[must_use]
+fn build_ambiguous(analyzed_files: &[AnalyzedFile]) -> Vec<AmbiguousChange> {
+    analyzed_files
+        .iter()
+        .filter_map(|file| {
+              if let ClassificationResult::Ambiguous {
+                candidates,
+                evidence,
+                ..
+            } = &file.classification
+            {
+                Some(AmbiguousChange {
+                    files: vec![file.path.clone()],
+                    candidates: candidates
+                        .iter()
+                        .map(|(pattern, _rule)| (pattern.clone(), evidence.clone()))
+                        .collect(),
+                    raw_changes: vec![],
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[must_use]
 fn build_unclassified(analyzed_files: &[AnalyzedFile]) -> Vec<UnclassifiedChange> {
     analyzed_files
         .iter()
@@ -247,6 +293,7 @@ fn build_unclassified(analyzed_files: &[AnalyzedFile]) -> Vec<UnclassifiedChange
             if let ClassificationResult::Unclassified {
                 raw_changes,
                 reason,
+                ..
             } = &file.classification
             {
                 Some(UnclassifiedChange {
@@ -264,6 +311,7 @@ fn build_unclassified(analyzed_files: &[AnalyzedFile]) -> Vec<UnclassifiedChange
 #[must_use]
 fn build_stats(
     intents: &[Intent],
+    ambiguous: &[AmbiguousChange],
     unclassified: &[UnclassifiedChange],
     elapsed: Duration,
 ) -> AnalysisStats {
@@ -281,7 +329,7 @@ fn build_stats(
             .iter()
             .filter(|intent| matches!(intent.policy, PolicyDecision::Blocked { .. }))
             .count(),
-        ambiguous: 0,
+        ambiguous: ambiguous.len(),
         unclassified: unclassified.len(),
         parse_duration_ms: 0,
         diff_duration_ms: 0,
