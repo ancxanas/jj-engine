@@ -37,6 +37,68 @@ pub fn generate(group: &IntentGroup, evidence: &[Evidence], rule: &str) -> Strin
 }
 
 #[must_use]
+pub fn summarize_changes(evidence: &[Evidence], file_count: usize) -> String {
+    let mut bugfix_count = 0;
+    let mut feature_count = 0;
+    let mut security_count = 0;
+    let mut refactor_count = 0;
+    let mut test_count = 0;
+
+    for e in evidence {
+        match &e.kind {
+            crate::core::types::EvidenceKind::NullGuardAdded
+            | crate::core::types::EvidenceKind::ErrorHandlerAdded
+            | crate::core::types::EvidenceKind::OptionalChainingAdded => bugfix_count += 1,
+            crate::core::types::EvidenceKind::ExportAdded
+            | crate::core::types::EvidenceKind::NewPublicApi => feature_count += 1,
+            crate::core::types::EvidenceKind::AuthCheckAdded
+            | crate::core::types::EvidenceKind::InputValidationAdded
+            | crate::core::types::EvidenceKind::SanitizationAdded => security_count += 1,
+            crate::core::types::EvidenceKind::SymbolRenamed
+            | crate::core::types::EvidenceKind::CodeMoved => refactor_count += 1,
+            crate::core::types::EvidenceKind::TestCaseAdded
+            | crate::core::types::EvidenceKind::TestCaseModified => test_count += 1,
+            _ => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    if bugfix_count > 0 {
+        parts.push(format!("{bugfix_count} bugfix"));
+    }
+    if feature_count > 0 {
+        parts.push(format!("{feature_count} feature"));
+    }
+    if security_count > 0 {
+        parts.push(format!("{security_count} security"));
+    }
+    if refactor_count > 0 {
+        parts.push(format!("{refactor_count} refactor"));
+    }
+    if test_count > 0 {
+        parts.push(format!("{test_count} test"));
+    }
+
+    if parts.is_empty() {
+        format!("update {file_count} files")
+    } else {
+        let summary = parts.join(", ");
+        format!("{summary} in {file_count} files")
+    }
+}
+
+#[must_use]
+pub fn truncate_message(message: &str, max_len: usize) -> String {
+    if message.len() <= max_len {
+        return message.to_string();
+    }
+    if max_len < 3 {
+        return message[..max_len].to_string();
+    }
+    format!("{}...", &message[..max_len - 3])
+}
+
+#[must_use]
 #[allow(clippy::match_same_arms)]
 const fn pattern_to_type(pattern: &ChangePattern) -> &'static str {
     match pattern {
@@ -152,5 +214,51 @@ mod tests {
         }];
         let message = generate(&group, &evidence, "null-guard");
         assert!(message.contains("NullGuardAdded: null guard in getUser"));
+    }
+
+    #[test]
+    fn summarize_changes_with_bugfix_and_feature() {
+        let evidence = vec![
+            crate::core::types::Evidence {
+                kind: EvidenceKind::NullGuardAdded,
+                description: "null guard".into(),
+                location: Location {
+                    file: PathBuf::from("src/auth.ts"),
+                    line: 42,
+                    column: 0,
+                },
+            },
+            crate::core::types::Evidence {
+                kind: EvidenceKind::ExportAdded,
+                description: "new export".into(),
+                location: Location {
+                    file: PathBuf::from("src/api.ts"),
+                    line: 10,
+                    column: 0,
+                },
+            },
+        ];
+        let summary = summarize_changes(&evidence, 3);
+        assert_eq!(summary, "1 bugfix, 1 feature in 3 files");
+    }
+
+    #[test]
+    fn summarize_changes_with_no_evidence() {
+        let summary = summarize_changes(&[], 5);
+        assert_eq!(summary, "update 5 files");
+    }
+
+    #[test]
+    fn truncate_message_short_enough() {
+        let msg = "short message";
+        assert_eq!(truncate_message(msg, 100), "short message");
+    }
+
+    #[test]
+    fn truncate_message_too_long() {
+        let msg = "this is a very long commit message that needs truncation";
+        let truncated = truncate_message(msg, 30);
+        assert_eq!(truncated.len(), 30);
+        assert!(truncated.ends_with("..."));
     }
 }

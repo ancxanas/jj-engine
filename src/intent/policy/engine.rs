@@ -16,6 +16,24 @@ pub fn evaluate(pattern: &ChangePattern) -> PolicyDecision {
     PolicyDecision::RequiresReview
 }
 
+#[must_use]
+pub fn evaluate_with_config(
+    pattern: &ChangePattern,
+    auto_patterns: &[ChangePattern],
+) -> PolicyDecision {
+    if rules::is_blocked(pattern) {
+        return PolicyDecision::Blocked {
+            reason: format!("{pattern:?} changes always require manual review"),
+        };
+    }
+
+    if auto_patterns.contains(pattern) {
+        return PolicyDecision::AutoCommittable;
+    }
+
+    PolicyDecision::RequiresReview
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -74,7 +74,39 @@ fn is_test_of(test_path: &Path, impl_path: &Path) -> bool {
         return false;
     };
 
-    base == impl_stem && test_path.parent() == impl_path.parent()
+    if base != impl_stem {
+        return false;
+    }
+
+    // Same directory (e.g., src/auth.test.ts → src/auth.ts)
+    if test_path.parent() == impl_path.parent() {
+        return true;
+    }
+
+    // Cross-directory: mirror the relative structure (e.g., tests/features/X.test.ts → src/features/X.ts)
+    // Strip the "tests" segment from the test path, then strip "src" from the impl path,
+    // and compare the directory portions (filenames already matched via stem check above).
+    let test_str = test_path.to_string_lossy();
+    let impl_str = impl_path.to_string_lossy();
+
+    let test_after = test_str
+        .strip_prefix("tests/")
+        .or_else(|| test_str.strip_prefix("tests\\"));
+    let impl_after = impl_str
+        .strip_prefix("src/")
+        .or_else(|| impl_str.strip_prefix("src\\"))
+        .or_else(|| impl_str.strip_prefix("lib/"))
+        .or_else(|| impl_str.strip_prefix("lib\\"));
+
+    if let (Some(t), Some(i)) = (test_after, impl_after) {
+        let test_dir = Path::new(t).parent().unwrap_or_else(|| Path::new(""));
+        let impl_dir = Path::new(i).parent().unwrap_or_else(|| Path::new(""));
+        if test_dir == impl_dir {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn is_directory_peer(a: &Path, b: &Path) -> bool {
@@ -127,9 +159,21 @@ mod tests {
     }
 
     #[test]
-    fn test_of_requires_same_directory() {
-        assert!(!is_test_of(
+    fn detects_cross_directory_test_of() {
+        assert!(is_test_of(
+            Path::new("tests/features/new-feature.test.ts"),
+            Path::new("src/features/new-feature.ts"),
+        ));
+        assert!(is_test_of(
             Path::new("tests/auth.test.ts"),
+            Path::new("src/auth.ts"),
+        ));
+    }
+
+    #[test]
+    fn cross_directory_requires_tests_prefix() {
+        assert!(!is_test_of(
+            Path::new("lib/auth.test.ts"),
             Path::new("src/auth.ts"),
         ));
     }

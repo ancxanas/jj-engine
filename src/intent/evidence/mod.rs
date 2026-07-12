@@ -1,6 +1,5 @@
 pub mod bugfix;
 pub mod dependency;
-pub mod docs;
 pub mod feature;
 pub mod refactor;
 pub mod security;
@@ -17,6 +16,5 @@ pub fn detect_all(changes: &[StructuralChange]) -> Vec<Evidence> {
     evidence.extend(security::detect(changes));
     evidence.extend(test::detect(changes));
     evidence.extend(dependency::detect(changes));
-    evidence.extend(docs::detect(changes));
     evidence
 }
