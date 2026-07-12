@@ -32,6 +32,7 @@ pub enum StructuralChangeKind {
     ImportRemoved,
     ExportAdded,
     ExportRemoved,
+    ExportModified,
     IfStatementAdded,
     TryCatchAdded,
     NullCheckAdded,
@@ -39,4 +40,7 @@ pub enum StructuralChangeKind {
     TestCaseAdded,
     TestCaseModified,
     DescribeBlockAdded,
+    FileModified,
+    FileAdded,
+    FileRemoved,
 }

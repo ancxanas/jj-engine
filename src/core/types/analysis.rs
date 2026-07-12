@@ -17,8 +17,7 @@ pub struct AnalysisResult {
 pub struct AnalysisMeta {
     pub timestamp: DateTime<Utc>,
     pub project_root: PathBuf,
-    pub jj_change_id: String,
-    pub jj_commit_id: String,
+    pub commit_sha: String,
     pub total_files_changed: usize,
     pub analysis_duration_ms: u64,
     pub analyzer_version: String,
