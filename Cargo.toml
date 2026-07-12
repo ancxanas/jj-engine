@@ -12,12 +12,12 @@ name = "avcs_lib"
 path = "src/lib.rs"
 
 [dependencies]
-jj-lib = { git = "https://github.com/martinvonz/jj", rev = "d52755b8dbd43291be6cb106b65e645c5b4448a0" }
+globset = "0.4.14"
+git2 = "0.20"
 tree-sitter = "0.22"
 tree-sitter-typescript = "0.21"
 tree-sitter-javascript = "0.21"
 petgraph = "0.6"
-tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,11 +27,17 @@ thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 owo-colors = "4"
 comfy-table = "7"
-futures = "0.3"
+notify = "7"
+notify-debouncer-mini = "0.5"
+log = "0.4"
+env_logger = "0.11"
+flexi_logger = "0.27"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 pretty_assertions = "1"
+tokio = { version = "1", features = ["full"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

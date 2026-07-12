@@ -1,6 +1,6 @@
 # AVCS - Autonomous Version Control System
 
-AVCS is an intelligent version control assistant that works with [Jujutsu (jj)](https://github.com/martinvonz/jj) to automatically analyze, classify, and cluster code changes. It identifies the intent behind modifications and generates appropriate commit messages with smart auto-commit policies.
+AVCS is an intelligent version control assistant that works with [Git](https://git-scm.com/) to automatically analyze, classify, and cluster code changes. It identifies the intent behind modifications and generates appropriate commit messages with smart auto-commit policies.
 
 ## Features
 
@@ -41,7 +41,7 @@ avcs status
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `avcs init` | Initialize AVCS in the current project |
 | `avcs analyze` | Analyze working copy changes and show intents |
 | `avcs preview` | Preview proposed commits before committing |
@@ -57,7 +57,7 @@ avcs status
 
 AVCS operates in several stages:
 
-1. **Diff Collection** - Retrieves working copy changes from jj
+1. **Diff Collection** - Retrieves working copy changes from git
 2. **Semantic Parsing** - Uses tree-sitter to parse TypeScript/JavaScript files and extract structural changes
 3. **Evidence Detection** - Analyzes code for patterns indicating change intent (test additions, security patterns, refactoring indicators)
 4. **Classification** - Matches changes against rules to determine the primary intent (feature, bugfix, refactor, etc.)
@@ -67,6 +67,7 @@ AVCS operates in several stages:
 ### Change Patterns
 
 AVCS classifies changes into these patterns:
+
 - **Feature** - New functionality additions
 - **Bugfix** - Bug corrections
 - **Refactor** - Code restructuring without behavior change
@@ -80,13 +81,14 @@ AVCS classifies changes into these patterns:
 ### Policy Decisions
 
 Each change group receives one of three policy decisions:
+
 - **AutoCommittable** - Safe to automatically commit
 - **RequiresReview** - Needs human review before commit
 - **Blocked** - Should not be committed (requires attention)
 
 ## Requirements
 
-- [Jujutsu (jj)](https://github.com/martinvonz/jj) - AVCS uses jj as the underlying VCS
+- [Git](https://git-scm.com/) - AVCS uses git as the underlying VCS
 - Rust 2021 edition or later
 
 ## Architecture
@@ -101,7 +103,7 @@ src/
 │   ├── evidence/    # Evidence detection modules
 │   ├── message/     # Commit message generation
 │   └── policy/      # Policy evaluation engine
-├── jj/            # Jujutsu integration
+├── vcs/           # Git integration via git2 crate
 └── semantic/      # Semantic analysis with tree-sitter
 ```
 
